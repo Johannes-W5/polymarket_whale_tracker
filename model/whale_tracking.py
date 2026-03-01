@@ -4,6 +4,7 @@ from __future__ import annotations
 
 Whale-tracking utilities for Polymarket events.
 
+
 Core idea:
 - Poll yes/no prices for a given event over time.
 - Detect large, unexpected jumps ("spikes") that may indicate informed flow.
