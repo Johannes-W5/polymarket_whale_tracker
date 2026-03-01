@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 """
+
 Whale-tracking utilities for Polymarket events.
 
 Core idea:
