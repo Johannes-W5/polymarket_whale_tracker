@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """
 
-Whale-tracking utilities for Polymarket events.
+Whale-tracking and informed-flow detection utilities for Polymarket events.
 
 
 Core idea:
@@ -17,9 +17,9 @@ This module does NOT make any trading decisions. It only:
 3) Provides a small CLI-style helper for quick experimentation.
 
 
-Start whale tracker: cd /home/johannes/polymarket_sentiment
+Start detector: cd /home/johannes/polymarket_sentiment
 source .venv/bin/activate   # oder: . .venv/bin/activate
-python -m model.whale_tracking 2890 (or other event id)
+python -m model.insider_detection 2890 (or other event id)
 Try to fetch not only one event but all events in the database. Create database query to get all events.
 """
 
@@ -30,12 +30,17 @@ from datetime import datetime, timezone
 from time import sleep
 from typing import Callable, Iterable, Iterator, Optional
 
-# Support both "python -m model.whale_tracking" (package context)
-# and direct execution "python model/whale_tracking.py".
+# Support both "python -m model.insider_detection" (package context)
+# and direct execution "python model/insider_detection.py".
 try:  # pragma: no cover - import fallback
     from .event_prices import EventPrices, get_event_prices  # type: ignore[relative-beyond-top-level]
 except ImportError:  # pragma: no cover
     from model.event_prices import EventPrices, get_event_prices
+
+try:  # pragma: no cover - import fallback
+    from .market_signals import NewsTiming, find_nearest_news_for_event  # type: ignore[relative-beyond-top-level]
+except ImportError:  # pragma: no cover
+    from model.market_signals import NewsTiming, find_nearest_news_for_event
 
 
 @dataclass
@@ -69,6 +74,22 @@ class WhaleSpike:
     to_price: float
     abs_change: float
     rel_change: float  # relative to from_price, e.g. 0.25 == +25%
+
+
+@dataclass
+class InformedFlowSignal:
+    """
+    Spike that likely happened before relevant news was publicly visible.
+
+    This is a heuristic signal, not proof of insider trading.
+    """
+
+    event_id: str
+    spike: WhaleSpike
+    lead_minutes: float
+    news_title: str
+    news_source: str
+    news_time: datetime
 
 
 def detect_spike_between(
@@ -173,9 +194,83 @@ def monitor_event_for_spikes(
         prev_sample = sample
 
 
+def assess_informed_flow_for_spike(
+    spike: WhaleSpike,
+    *,
+    base_url: str,
+    news_path: str = "data/news_events.jsonl",
+    min_news_lead_minutes: float = 5.0,
+    news_window_minutes: float = 240.0,
+) -> InformedFlowSignal | None:
+    """
+    Classify a spike as "possible informed flow" if it clearly leads nearby news.
+
+    Logic:
+    - Find nearest related news around the spike timestamp.
+    - Require that news timestamp is AFTER the spike by at least
+      `min_news_lead_minutes`.
+    """
+    nearest: NewsTiming | None = find_nearest_news_for_event(
+        spike.event_id,
+        signal_time=spike.to_ts,
+        base_url=base_url,
+        news_path=news_path,
+        window_minutes=news_window_minutes,
+    )
+    if nearest is None:
+        return None
+
+    # Positive delta means the news was ingested after the spike.
+    if nearest.delta_minutes < min_news_lead_minutes:
+        return None
+
+    return InformedFlowSignal(
+        event_id=spike.event_id,
+        spike=spike,
+        lead_minutes=nearest.delta_minutes,
+        news_title=nearest.title,
+        news_source=nearest.source,
+        news_time=nearest.news_time,
+    )
+
+
+def monitor_event_for_informed_flow(
+    event_id: str,
+    *,
+    base_url: str,
+    interval_seconds: float = 60.0,
+    min_abs_change: float = 0.1,
+    min_rel_change: float = 0.3,
+    news_path: str = "data/news_events.jsonl",
+    min_news_lead_minutes: float = 5.0,
+    news_window_minutes: float = 240.0,
+    sample_iter_factory: Callable[..., Iterable[PriceSample]] | None = None,
+) -> Iterator[InformedFlowSignal]:
+    """
+    Continuously monitor and emit spikes that appear to lead relevant news.
+    """
+    for spike in monitor_event_for_spikes(
+        event_id,
+        base_url=base_url,
+        interval_seconds=interval_seconds,
+        min_abs_change=min_abs_change,
+        min_rel_change=min_rel_change,
+        sample_iter_factory=sample_iter_factory,
+    ):
+        signal = assess_informed_flow_for_spike(
+            spike,
+            base_url=base_url,
+            news_path=news_path,
+            min_news_lead_minutes=min_news_lead_minutes,
+            news_window_minutes=news_window_minutes,
+        )
+        if signal is not None:
+            yield signal
+
+
 if __name__ == "__main__":
     # Minimal CLI for manual experimentation:
-    # python -m model.whale_tracking EVENT_ID
+    # python -m model.insider_detection EVENT_ID
     import argparse
     import os
 
@@ -208,6 +303,23 @@ if __name__ == "__main__":
         default=0.3,
         help="Minimum relative price change (fraction, default: 0.3 == 30%%).",
     )
+    parser.add_argument(
+        "--news-path",
+        default="data/news_events.jsonl",
+        help="Path to JSONL news dataset used for pre-news informed-flow checks.",
+    )
+    parser.add_argument(
+        "--min-news-lead",
+        type=float,
+        default=5.0,
+        help="Flag informed flow only if spike leads news by at least N minutes.",
+    )
+    parser.add_argument(
+        "--news-window",
+        type=float,
+        default=240.0,
+        help="News matching window in minutes around each spike timestamp.",
+    )
 
     args = parser.parse_args()
 
@@ -234,4 +346,19 @@ if __name__ == "__main__":
             f"(Δ={spike.abs_change:+.3f}, rel={spike.rel_change*100:.1f}%)",
             f"window={int((spike.to_ts - spike.from_ts).total_seconds())}s",
         )
+        informed_signal = assess_informed_flow_for_spike(
+            spike,
+            base_url=args.base_url,
+            news_path=args.news_path,
+            min_news_lead_minutes=args.min_news_lead,
+            news_window_minutes=args.news_window,
+        )
+        if informed_signal is not None:
+            print(
+                "[informed-flow?]",
+                informed_signal.event_id,
+                f"lead={informed_signal.lead_minutes:.1f}m",
+                f"source={informed_signal.news_source}",
+                f"title={informed_signal.news_title}",
+            )
 

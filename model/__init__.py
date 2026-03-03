@@ -9,12 +9,15 @@ from model.event_prices import (
     get_event_no_price,
     get_event_yes_price,
 )
-from model.whale_tracking import (
+from model.insider_detection import (
     PriceSample,
     WhaleSpike,
+    InformedFlowSignal,
     detect_spike_between,
     iter_price_samples,
     monitor_event_for_spikes,
+    assess_informed_flow_for_spike,
+    monitor_event_for_informed_flow,
 )
 
 __all__ = [
@@ -26,7 +29,10 @@ __all__ = [
     # Whale tracking
     "PriceSample",
     "WhaleSpike",
+    "InformedFlowSignal",
     "detect_spike_between",
     "iter_price_samples",
     "monitor_event_for_spikes",
+    "assess_informed_flow_for_spike",
+    "monitor_event_for_informed_flow",
 ]
