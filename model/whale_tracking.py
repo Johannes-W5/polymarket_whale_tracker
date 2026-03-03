@@ -23,8 +23,7 @@ python -m model.whale_tracking 2890 (or other event id)
 Try to fetch not only one event but all events in the database. Create database query to get all events.
 """
 
-from database.events import get_events
-from database.whale_spikes import insert_whale_spike
+from database.events import get_events, insert_whale_spike
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -118,7 +117,7 @@ def iter_price_samples(
     event_id: str,
     *,
     base_url: str,
-    interval_seconds: float = 60.0,
+    interval_seconds: float = 5.0,
     side: str = "BUY",
 ) -> Iterator[PriceSample]:
     """

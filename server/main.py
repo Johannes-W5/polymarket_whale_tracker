@@ -126,8 +126,27 @@ async def get_price(request: Request):
 
 @app.get("/prices", tags=["CLOB"])
 async def get_prices(request: Request):
-    """Prices for multiple tokens."""
-    return await _proxy_get(request, CLOB_API, "/prices")
+    """Prices for multiple tokens. Converts GET params to POST body (CLOB expects POST)."""
+    token_ids_raw = request.query_params.get("token_ids") or ""
+    sides_raw = request.query_params.get("sides") or ""
+    token_ids = [s.strip() for s in token_ids_raw.split(",") if s.strip()]
+    sides = [s.strip().upper() for s in sides_raw.split(",") if s.strip()]
+    if len(token_ids) != len(sides) or not token_ids:
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "token_ids and sides must be comma-separated and same length"},
+        )
+    body = [
+        {"token_id": tid, "side": side if side in ("BUY", "SELL") else "BUY"}
+        for tid, side in zip(token_ids, sides)
+    ]
+    client: httpx.AsyncClient = request.app.state.http
+    r = await client.post(f"{CLOB_API}/prices", json=body)
+    try:
+        content = r.json()
+    except Exception:
+        content = {"detail": r.text}
+    return JSONResponse(status_code=r.status_code, content=content)
 
 
 @app.get("/book", tags=["CLOB"])

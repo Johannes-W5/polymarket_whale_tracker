@@ -1,0 +1,3 @@
+activate venv: source .venv/bin/activate
+start server: python -m uvicorn main:app --reload
+start whale tracker: python -m model.whale_tracking 2890
