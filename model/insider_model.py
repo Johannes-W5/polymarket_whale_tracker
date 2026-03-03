@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 from openai import OpenAI
 
+from database.events import get_event as get_event_from_db
 from .event_prices import DEFAULT_BASE_URL
 from .market_signals import (
     VolumeStats,
@@ -69,6 +70,22 @@ def _fetch_event_raw(
         r = client.get(f"{base}/events/{event_id}")
         r.raise_for_status()
         return r.json()
+
+
+def _fetch_event_db(event_id: str) -> Dict[str, Any] | None:
+    """
+    Load event metadata from PostgreSQL if available.
+    """
+    event = get_event_from_db(event_id)
+    if not event:
+        return None
+    if isinstance(event, dict):
+        return dict(event)
+    # psycopg2 RealDictRow behaves like a mapping, normalize to plain dict.
+    try:
+        return dict(event)
+    except Exception:
+        return None
 
 
 def _simplify_event(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -116,6 +133,8 @@ def _build_feature_payload(
     *,
     base_url: str,
     news_path: str = "data/news_events.jsonl",
+    include_db_event: bool = True,
+    trigger_context: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """
     Collect event metadata and derived signals into a single JSON-serialisable
@@ -123,6 +142,7 @@ def _build_feature_payload(
     """
     event_raw = _fetch_event_raw(event_id, base_url=base_url)
     event_simple = _simplify_event(event_raw)
+    event_db = _fetch_event_db(event_id) if include_db_event else None
 
     volume: VolumeStats = compute_volume_stats(event_id, base_url=base_url)
     orderbooks: List[OrderbookImbalance] = compute_orderbook_imbalance_for_event(
@@ -153,12 +173,14 @@ def _build_feature_payload(
 
     payload: Dict[str, Any] = {
         "event": event_simple,
+        "event_db": event_db,
         "generated_at": _isoformat(now_utc),
         "volume_stats": asdict(volume),
         "orderbook_imbalance": _asdict_list(orderbooks),
         "open_interest": _asdict_list(oi_snapshots),
         "price_history_stats": _asdict_list(price_stats),
         "news_timing": asdict(news_timing) if news_timing is not None else None,
+        "trigger_context": trigger_context,
     }
     return payload
 
@@ -203,6 +225,8 @@ def assess_insider_probability_for_event(
     model: str = "gpt-4.1-mini",
     news_path: str = "data/news_events.jsonl",
     temperature: float = 0.1,
+    include_db_event: bool = True,
+    trigger_context: Dict[str, Any] | None = None,
 ) -> InsiderAssessment:
     """
     High-level helper: call OpenAI to estimate insider-trading likelihood.
@@ -214,12 +238,16 @@ def assess_insider_probability_for_event(
         model: OpenAI chat model name.
         news_path: Path to `news_events.jsonl` for the news-timing feature.
         temperature: Sampling temperature for the model (default 0.1).
+        include_db_event: Include PostgreSQL event row in model features.
+        trigger_context: Optional metadata about why assessment was triggered.
     """
     client = _get_openai_client(api_key=openai_api_key)
     features = _build_feature_payload(
         event_id,
         base_url=base_url,
         news_path=news_path,
+        include_db_event=include_db_event,
+        trigger_context=trigger_context,
     )
     prompt = _build_prompt(features)
 

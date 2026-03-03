@@ -23,12 +23,12 @@ python -m model.insider_detection 2890 (or other event id)
 Try to fetch not only one event but all events in the database. Create database query to get all events.
 """
 
-from database.events import get_events, insert_whale_spike
+from database.events import insert_whale_spike
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from time import sleep
-from typing import Callable, Iterable, Iterator, Optional
+from typing import Any, Callable, Dict, Iterable, Iterator, Optional
 
 # Support both "python -m model.insider_detection" (package context)
 # and direct execution "python model/insider_detection.py".
@@ -41,6 +41,11 @@ try:  # pragma: no cover - import fallback
     from .market_signals import NewsTiming, find_nearest_news_for_event  # type: ignore[relative-beyond-top-level]
 except ImportError:  # pragma: no cover
     from model.market_signals import NewsTiming, find_nearest_news_for_event
+
+try:  # pragma: no cover - import fallback
+    from .insider_model import InsiderAssessment, assess_insider_probability_for_event  # type: ignore[relative-beyond-top-level]
+except ImportError:  # pragma: no cover
+    from model.insider_model import InsiderAssessment, assess_insider_probability_for_event
 
 
 @dataclass
@@ -90,6 +95,19 @@ class InformedFlowSignal:
     news_title: str
     news_source: str
     news_time: datetime
+
+
+@dataclass
+class TriggeredInsiderAssessment:
+    """
+    Result of running insider_model for a detection trigger.
+    """
+
+    event_id: str
+    trigger_type: str  # "whale_spike" | "informed_flow"
+    spike: WhaleSpike
+    informed_flow: InformedFlowSignal | None
+    assessment: InsiderAssessment
 
 
 def detect_spike_between(
@@ -268,6 +286,101 @@ def monitor_event_for_informed_flow(
             yield signal
 
 
+def _isoformat(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
+
+
+def _spike_trigger_payload(spike: WhaleSpike) -> Dict[str, Any]:
+    return {
+        "event_id": spike.event_id,
+        "from_ts": _isoformat(spike.from_ts),
+        "to_ts": _isoformat(spike.to_ts),
+        "side": spike.side,
+        "from_price": spike.from_price,
+        "to_price": spike.to_price,
+        "abs_change": spike.abs_change,
+        "rel_change": spike.rel_change,
+    }
+
+
+def _informed_flow_trigger_payload(signal: InformedFlowSignal) -> Dict[str, Any]:
+    payload = _spike_trigger_payload(signal.spike)
+    payload.update(
+        {
+            "lead_minutes": signal.lead_minutes,
+            "news_title": signal.news_title,
+            "news_source": signal.news_source,
+            "news_time": _isoformat(signal.news_time),
+        }
+    )
+    return payload
+
+
+def monitor_event_and_assess_insider(
+    event_id: str,
+    *,
+    base_url: str,
+    interval_seconds: float = 60.0,
+    min_abs_change: float = 0.1,
+    min_rel_change: float = 0.3,
+    news_path: str = "data/news_events.jsonl",
+    min_news_lead_minutes: float = 5.0,
+    news_window_minutes: float = 240.0,
+    openai_model: str = "gpt-4.1-mini",
+    openai_temperature: float = 0.1,
+    sample_iter_factory: Callable[..., Iterable[PriceSample]] | None = None,
+) -> Iterator[TriggeredInsiderAssessment]:
+    """
+    Run insider_model only when a spike or informed-flow signal is detected.
+    """
+    for spike in monitor_event_for_spikes(
+        event_id,
+        base_url=base_url,
+        interval_seconds=interval_seconds,
+        min_abs_change=min_abs_change,
+        min_rel_change=min_rel_change,
+        sample_iter_factory=sample_iter_factory,
+    ):
+        # Persist each detected spike for downstream querying/auditing.
+        insert_whale_spike(spike)
+
+        informed_signal = assess_informed_flow_for_spike(
+            spike,
+            base_url=base_url,
+            news_path=news_path,
+            min_news_lead_minutes=min_news_lead_minutes,
+            news_window_minutes=news_window_minutes,
+        )
+        if informed_signal is not None:
+            trigger_type = "informed_flow"
+            trigger_payload = _informed_flow_trigger_payload(informed_signal)
+        else:
+            trigger_type = "whale_spike"
+            trigger_payload = _spike_trigger_payload(spike)
+
+        assessment = assess_insider_probability_for_event(
+            event_id=event_id,
+            base_url=base_url,
+            model=openai_model,
+            news_path=news_path,
+            temperature=openai_temperature,
+            include_db_event=True,
+            trigger_context={
+                "trigger_type": trigger_type,
+                "trigger_payload": trigger_payload,
+            },
+        )
+        yield TriggeredInsiderAssessment(
+            event_id=event_id,
+            trigger_type=trigger_type,
+            spike=spike,
+            informed_flow=informed_signal,
+            assessment=assessment,
+        )
+
+
 if __name__ == "__main__":
     # Minimal CLI for manual experimentation:
     # python -m model.insider_detection EVENT_ID
@@ -320,6 +433,17 @@ if __name__ == "__main__":
         default=240.0,
         help="News matching window in minutes around each spike timestamp.",
     )
+    parser.add_argument(
+        "--openai-model",
+        default="gpt-4.1-mini",
+        help="OpenAI model name used for insider assessment.",
+    )
+    parser.add_argument(
+        "--openai-temperature",
+        type=float,
+        default=0.1,
+        help="OpenAI sampling temperature for insider assessment.",
+    )
 
     args = parser.parse_args()
 
@@ -329,13 +453,19 @@ if __name__ == "__main__":
         f"(min_abs={args.min_abs}, min_rel={args.min_rel})"
     )
 
-    for spike in monitor_event_for_spikes(
+    for result in monitor_event_and_assess_insider(
         args.event_id,
         base_url=args.base_url,
         interval_seconds=args.interval,
         min_abs_change=args.min_abs,
         min_rel_change=args.min_rel,
+        news_path=args.news_path,
+        min_news_lead_minutes=args.min_news_lead,
+        news_window_minutes=args.news_window,
+        openai_model=args.openai_model,
+        openai_temperature=args.openai_temperature,
     ):
+        spike = result.spike
         direction = "UP" if spike.abs_change > 0 else "DOWN"
         print(
             "[whale-spike]",
@@ -346,19 +476,20 @@ if __name__ == "__main__":
             f"(Δ={spike.abs_change:+.3f}, rel={spike.rel_change*100:.1f}%)",
             f"window={int((spike.to_ts - spike.from_ts).total_seconds())}s",
         )
-        informed_signal = assess_informed_flow_for_spike(
-            spike,
-            base_url=args.base_url,
-            news_path=args.news_path,
-            min_news_lead_minutes=args.min_news_lead,
-            news_window_minutes=args.news_window,
-        )
-        if informed_signal is not None:
+        if result.informed_flow is not None:
             print(
                 "[informed-flow?]",
-                informed_signal.event_id,
-                f"lead={informed_signal.lead_minutes:.1f}m",
-                f"source={informed_signal.news_source}",
-                f"title={informed_signal.news_title}",
+                result.informed_flow.event_id,
+                f"lead={result.informed_flow.lead_minutes:.1f}m",
+                f"source={result.informed_flow.news_source}",
+                f"title={result.informed_flow.news_title}",
             )
+        print(
+            "[insider-assessment]",
+            result.event_id,
+            f"trigger={result.trigger_type}",
+            f"prob={result.assessment.probability_insider:.3f}",
+            f"confidence={result.assessment.confidence}",
+            f"summary={result.assessment.short_summary}",
+        )
 
