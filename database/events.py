@@ -30,7 +30,11 @@ def _normalize_event_for_db(event: Any) -> SimpleNamespace:
         or _event_get(event, "createdAt")
         or datetime.utcnow()
     )
-    active = bool(_event_get(event, "active", True))
+    # An event is considered active only if it is not closed.
+    # The Gamma API's own `active` field is unreliable (returns True even for
+    # resolved/closed events), so we use `closed=False` as the definitive signal.
+    closed = bool(_event_get(event, "closed", False))
+    active = not closed
     return SimpleNamespace(
         id=str(event_id),
         name=str(name),

@@ -74,14 +74,23 @@ def get_event_prices(
     """
     base = base_url.rstrip("/")
     with httpx.Client(timeout=timeout) as client:
-        # 1) Get event and token IDs from first market
+        # 1) Get event and token IDs from first open (non-closed) market
         r = client.get(f"{base}/events/{event_id}")
         r.raise_for_status()
         event: dict[str, Any] = r.json()
         markets = event.get("markets") or []
         if not markets:
             return EventPrices(yes_price=None, no_price=None)
-        market = markets[market_index] if market_index < len(markets) else markets[0]
+
+        # Prefer open markets; closed markets have no CLOB prices
+        open_markets = [m for m in markets if not m.get("closed", False)]
+        if open_markets:
+            market = open_markets[0]
+        elif market_index < len(markets):
+            market = markets[market_index]
+        else:
+            market = markets[0]
+
         yes_token_id, no_token_id = _parse_clob_token_ids(market)
         if not yes_token_id or not no_token_id:
             return EventPrices(
@@ -110,12 +119,22 @@ def get_event_prices(
 
         yes_map = data.get(yes_token_id) or {}
         no_map = data.get(no_token_id) or {}
-        yes_price = yes_map.get(side) if isinstance(yes_map.get(side), (int, float)) else None
-        no_price = no_map.get(side) if isinstance(no_map.get(side), (int, float)) else None
+
+        def _to_float(val: Any) -> float | None:
+            """Parse numeric price from API (may be returned as string or number)."""
+            if val is None:
+                return None
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                return None
+
+        yes_price = _to_float(yes_map.get(side))
+        no_price = _to_float(no_map.get(side))
 
         return EventPrices(
-            yes_price=float(yes_price) if yes_price is not None else None,
-            no_price=float(no_price) if no_price is not None else None,
+            yes_price=yes_price,
+            no_price=no_price,
             yes_token_id=yes_token_id,
             no_token_id=no_token_id,
         )

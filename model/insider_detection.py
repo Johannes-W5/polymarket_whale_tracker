@@ -121,8 +121,8 @@ def detect_spike_between(
     prev_sample: PriceSample,
     curr_sample: PriceSample,
     *,
-    min_abs_change: float = 0.1,
-    min_rel_change: float = 0.3,
+    min_abs_change: float = 0.01,
+    min_rel_change: float = 0.01, #change to 0.3 for more sensitive detection again
 ) -> list[WhaleSpike]:
     """
     Detect price spikes between two samples for an event.
@@ -177,8 +177,7 @@ def iter_price_samples(
             prices = get_event_prices(event_id, base_url=base_url, side=side)
             yield PriceSample.from_event_prices(event_id, prices)
         except Exception as exc:
-            #print(f"[whale-tracking] Skipping sample for event {event_id}: {exc}")
-            pass
+            print(f"[whale-tracking] Skipping sample for event {event_id}: {exc}")
         sleep(interval_seconds)
 
 
@@ -187,8 +186,8 @@ def monitor_event_for_spikes(
     *,
     base_url: str,
     interval_seconds: float = 5.0,
-    min_abs_change: float = 0.1,
-    min_rel_change: float = 0.3,
+    min_abs_change: float = 0.01, 
+    min_rel_change: float = 0.01, #change to 0.3 again for more sensitive detection
     sample_iter_factory: Callable[..., Iterable[PriceSample]] | None = None,
 ) -> Iterator[WhaleSpike]:
     """
@@ -268,8 +267,8 @@ def monitor_event_for_informed_flow(
     *,
     base_url: str,
     interval_seconds: float = 5.0,
-    min_abs_change: float = 0.1,
-    min_rel_change: float = 0.3,
+    min_abs_change: float = 0.01,
+    min_rel_change: float = 0.01, #change to 0.3 again for more sensitive detection
     news_path: str = "data/news_events.jsonl",
     min_news_lead_minutes: float = 5.0,
     news_window_minutes: float = 240.0,
@@ -334,8 +333,8 @@ def monitor_event_and_assess_insider(
     *,
     base_url: str,
     interval_seconds: float = 5.0,
-    min_abs_change: float = 0.1,
-    min_rel_change: float = 0.3,
+    min_abs_change: float = 0.01,
+    min_rel_change: float = 0.01, #change to 0.3 again for more sensitive detection
     news_path: str = "data/news_events.jsonl",
     min_news_lead_minutes: float = 5.0,
     news_window_minutes: float = 240.0,
@@ -407,8 +406,8 @@ def monitor_events_and_assess_insider(
     *,
     base_url: str,
     interval_seconds: float = 5.0,
-    min_abs_change: float = 0.1,
-    min_rel_change: float = 0.3,
+    min_abs_change: float = 0.01,
+    min_rel_change: float = 0.01, #change to 0.3 again for more sensitive detection
     news_path: str = "data/news_events.jsonl",
     min_news_lead_minutes: float = 5.0,
     news_window_minutes: float = 240.0,
@@ -511,13 +510,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--min-abs",
         type=float,
-        default=0.1,
+        default=0.01,
         help="Minimum absolute price change to flag a spike (default: 0.1).",
     )
-    parser.add_argument(
+    parser.add_argument( 
         "--min-rel",
         type=float,
-        default=0.3,
+        default=0.01, #change to 0.3 again for more sensitive detection
         help="Minimum relative price change (fraction, default: 0.3 == 30%%).",
     )
     parser.add_argument(
