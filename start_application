@@ -1,0 +1,13 @@
+start application: 
+
+Terminal	Command
+cd server && python -m uvicorn main:app --reload
+
+#start event cache
+python -m model.event_cache 
+
+# monitor specific events (unchanged)
+python -m model.insider_detection 2890 3100 --interval 5
+
+# monitor ALL events from the database
+python -m model.insider_detection --all-events --interval 1200 (--all-events calls database/events.py with get_all_event_ids())

@@ -25,8 +25,13 @@ from typing import Any, Dict, List, Optional
 import httpx
 from openai import OpenAI
 
-from database.events import get_event as get_event_from_db
+from database.events import (
+    get_event as get_event_from_db,
+    get_recent_whale_spikes,
+    insert_event as insert_event_to_db,
+)
 from .event_prices import DEFAULT_BASE_URL
+from .fresh_data import fetch_fresh_market_data_from_api
 from .market_signals import (
     VolumeStats,
     OrderbookImbalance,
@@ -88,6 +93,35 @@ def _fetch_event_db(event_id: str) -> Dict[str, Any] | None:
         return None
 
 
+def _cache_event_in_db(event: Dict[str, Any]) -> None:
+    """
+    Best-effort cache of slow-changing event metadata in PostgreSQL.
+    """
+    try:
+        insert_event_to_db(event)
+    except Exception:
+        # Do not fail scoring if DB cache is temporarily unavailable.
+        pass
+
+
+def _fetch_recent_spikes_db(event_id: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """
+    Load recently detected spikes for this event from PostgreSQL.
+    """
+    try:
+        rows = get_recent_whale_spikes(event_id, limit=limit) or []
+    except Exception:
+        return []
+
+    result: List[Dict[str, Any]] = []
+    for row in rows:
+        try:
+            result.append(dict(row))
+        except Exception:
+            continue
+    return result
+
+
 def _simplify_event(event: Dict[str, Any]) -> Dict[str, Any]:
     markets = event.get("markets") or []
     simple_markets: List[Dict[str, Any]] = []
@@ -135,14 +169,17 @@ def _build_feature_payload(
     news_path: str = "data/news_events.jsonl",
     include_db_event: bool = True,
     trigger_context: Dict[str, Any] | None = None,
+    fresh_market_data: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """
     Collect event metadata and derived signals into a single JSON-serialisable
     payload to feed into the OpenAI model.
     """
     event_raw = _fetch_event_raw(event_id, base_url=base_url)
+    _cache_event_in_db(event_raw)
     event_simple = _simplify_event(event_raw)
     event_db = _fetch_event_db(event_id) if include_db_event else None
+    recent_spikes_db = _fetch_recent_spikes_db(event_id, limit=5)
 
     volume: VolumeStats = compute_volume_stats(event_id, base_url=base_url)
     orderbooks: List[OrderbookImbalance] = compute_orderbook_imbalance_for_event(
@@ -161,6 +198,10 @@ def _build_feature_payload(
     # For news timing we use "now" as the signal time by default; callers
     # can override later if needed.
     now_utc = datetime.now(timezone.utc)
+    fresh_data = fresh_market_data or fetch_fresh_market_data_from_api(
+        event_id,
+        base_url=base_url,
+    )
     news_timing: Optional[NewsTiming] = find_nearest_news_for_event(
         event_id,
         signal_time=now_utc,
@@ -174,7 +215,9 @@ def _build_feature_payload(
     payload: Dict[str, Any] = {
         "event": event_simple,
         "event_db": event_db,
+        "recent_whale_spikes_db": recent_spikes_db,
         "generated_at": _isoformat(now_utc),
+        "fresh_market_data": fresh_data,
         "volume_stats": asdict(volume),
         "orderbook_imbalance": _asdict_list(orderbooks),
         "open_interest": _asdict_list(oi_snapshots),
@@ -227,6 +270,7 @@ def assess_insider_probability_for_event(
     temperature: float = 0.1,
     include_db_event: bool = True,
     trigger_context: Dict[str, Any] | None = None,
+    fresh_market_data: Dict[str, Any] | None = None,
 ) -> InsiderAssessment:
     """
     High-level helper: call OpenAI to estimate insider-trading likelihood.
@@ -240,6 +284,8 @@ def assess_insider_probability_for_event(
         temperature: Sampling temperature for the model (default 0.1).
         include_db_event: Include PostgreSQL event row in model features.
         trigger_context: Optional metadata about why assessment was triggered.
+        fresh_market_data: Optional trigger-time snapshot (e.g. websocket cache).
+            If omitted, a fresh API snapshot is fetched automatically.
     """
     client = _get_openai_client(api_key=openai_api_key)
     features = _build_feature_payload(
@@ -248,6 +294,7 @@ def assess_insider_probability_for_event(
         news_path=news_path,
         include_db_event=include_db_event,
         trigger_context=trigger_context,
+        fresh_market_data=fresh_market_data,
     )
     prompt = _build_prompt(features)
 

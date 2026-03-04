@@ -1,11 +1,57 @@
 # database/events.py
 from contextlib import closing
+from datetime import datetime
+from types import SimpleNamespace
+from typing import Any, Mapping
+
 from .connection import get_connection
+
+
+def _event_get(event: Any, key: str, default: Any = None) -> Any:
+    if isinstance(event, Mapping):
+        return event.get(key, default)
+    return getattr(event, key, default)
+
+
+def _normalize_event_for_db(event: Any) -> SimpleNamespace:
+    event_id = _event_get(event, "id")
+    if event_id is None:
+        raise ValueError("event id is required for insert_event")
+
+    name = (
+        _event_get(event, "name")
+        or _event_get(event, "title")
+        or _event_get(event, "slug")
+        or str(event_id)
+    )
+    description = _event_get(event, "description")
+    created_at = (
+        _event_get(event, "created_at")
+        or _event_get(event, "createdAt")
+        or datetime.utcnow()
+    )
+    active = bool(_event_get(event, "active", True))
+    return SimpleNamespace(
+        id=str(event_id),
+        name=str(name),
+        description=str(description) if description is not None else None,
+        created_at=created_at,
+        active=active,
+    )
+
 
 def get_events():
     with closing(get_connection()) as conn, conn.cursor() as cur:
         cur.execute("SELECT * FROM events;")
         return cur.fetchall()   # list[dict]
+
+
+def get_all_event_ids() -> list[str]:
+    """Return IDs of all active events stored in the database, sorted ascending."""
+    with closing(get_connection()) as conn, conn.cursor() as cur:
+        cur.execute("SELECT id FROM events WHERE active = TRUE ORDER BY id;")
+        rows = cur.fetchall()
+    return [str(row["id"]) for row in rows]
 
 
 def get_event(event_id: str):
@@ -15,18 +61,26 @@ def get_event(event_id: str):
 
 
 def insert_event(event):
+    normalized = _normalize_event_for_db(event)
     with closing(get_connection()) as conn, conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO events (id, name, description, created_at)
-            VALUES (%s,%s,%s,%s)
+            INSERT INTO events (id, name, description, created_at, active)
+            VALUES (%s,%s,%s,%s,%s)
             ON CONFLICT (id) DO UPDATE
             SET
               name = EXCLUDED.name,
               description = EXCLUDED.description,
-              created_at = EXCLUDED.created_at;
+              created_at = EXCLUDED.created_at,
+              active = EXCLUDED.active;
             """,
-            (event.id, event.name, event.description, event.created_at),
+            (
+                normalized.id,
+                normalized.name,
+                normalized.description,
+                normalized.created_at,
+                normalized.active,
+            ),
         )
         conn.commit()
 
@@ -85,3 +139,27 @@ def update_market_volume(market_id: str, volume: float):
             (market_id, volume),
         )
         conn.commit()
+
+
+def get_recent_whale_spikes(event_id: str, limit: int = 5):
+    with closing(get_connection()) as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+              event_id,
+              market_id,
+              from_ts,
+              to_ts,
+              side,
+              from_price,
+              to_price,
+              abs_change,
+              rel_change
+            FROM whale_spikes
+            WHERE event_id = %s
+            ORDER BY to_ts DESC
+            LIMIT %s;
+            """,
+            (event_id, max(1, min(int(limit), 100))),
+        )
+        return cur.fetchall()

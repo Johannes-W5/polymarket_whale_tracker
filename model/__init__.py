@@ -9,6 +9,11 @@ from model.event_prices import (
     get_event_no_price,
     get_event_yes_price,
 )
+from model.fresh_data import (
+    InMemoryFreshDataStore,
+    fetch_fresh_market_data_from_api,
+)
+from model.event_cache import sync_events_to_db
 from model.insider_detection import (
     PriceSample,
     WhaleSpike,
@@ -20,6 +25,7 @@ from model.insider_detection import (
     assess_informed_flow_for_spike,
     monitor_event_for_informed_flow,
     monitor_event_and_assess_insider,
+    monitor_events_and_assess_insider,
 )
 
 __all__ = [
@@ -28,6 +34,9 @@ __all__ = [
     "get_event_prices",
     "get_event_yes_price",
     "get_event_no_price",
+    "fetch_fresh_market_data_from_api",
+    "InMemoryFreshDataStore",
+    "sync_events_to_db",
     # Whale tracking
     "PriceSample",
     "WhaleSpike",
@@ -39,4 +48,5 @@ __all__ = [
     "assess_informed_flow_for_spike",
     "monitor_event_for_informed_flow",
     "monitor_event_and_assess_insider",
+    "monitor_events_and_assess_insider",
 ]

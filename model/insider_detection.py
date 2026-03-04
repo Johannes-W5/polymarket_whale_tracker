@@ -25,10 +25,12 @@ Try to fetch not only one event but all events in the database. Create database 
 
 from database.events import insert_whale_spike
 
+import queue
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from time import sleep
-from typing import Any, Callable, Dict, Iterable, Iterator, Optional
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 
 # Support both "python -m model.insider_detection" (package context)
 # and direct execution "python model/insider_detection.py".
@@ -46,6 +48,11 @@ try:  # pragma: no cover - import fallback
     from .insider_model import InsiderAssessment, assess_insider_probability_for_event  # type: ignore[relative-beyond-top-level]
 except ImportError:  # pragma: no cover
     from model.insider_model import InsiderAssessment, assess_insider_probability_for_event
+
+try:  # pragma: no cover - import fallback
+    from .fresh_data import fetch_fresh_market_data_from_api  # type: ignore[relative-beyond-top-level]
+except ImportError:  # pragma: no cover
+    from model.fresh_data import fetch_fresh_market_data_from_api
 
 
 @dataclass
@@ -166,8 +173,12 @@ def iter_price_samples(
     when you want to stop the loop.
     """
     while True:
-        prices = get_event_prices(event_id, base_url=base_url, side=side)
-        yield PriceSample.from_event_prices(event_id, prices)
+        try:
+            prices = get_event_prices(event_id, base_url=base_url, side=side)
+            yield PriceSample.from_event_prices(event_id, prices)
+        except Exception as exc:
+            #print(f"[whale-tracking] Skipping sample for event {event_id}: {exc}")
+            pass
         sleep(interval_seconds)
 
 
@@ -175,7 +186,7 @@ def monitor_event_for_spikes(
     event_id: str,
     *,
     base_url: str,
-    interval_seconds: float = 60.0,
+    interval_seconds: float = 5.0,
     min_abs_change: float = 0.1,
     min_rel_change: float = 0.3,
     sample_iter_factory: Callable[..., Iterable[PriceSample]] | None = None,
@@ -256,7 +267,7 @@ def monitor_event_for_informed_flow(
     event_id: str,
     *,
     base_url: str,
-    interval_seconds: float = 60.0,
+    interval_seconds: float = 5.0,
     min_abs_change: float = 0.1,
     min_rel_change: float = 0.3,
     news_path: str = "data/news_events.jsonl",
@@ -322,7 +333,7 @@ def monitor_event_and_assess_insider(
     event_id: str,
     *,
     base_url: str,
-    interval_seconds: float = 60.0,
+    interval_seconds: float = 5.0,
     min_abs_change: float = 0.1,
     min_rel_change: float = 0.3,
     news_path: str = "data/news_events.jsonl",
@@ -331,6 +342,7 @@ def monitor_event_and_assess_insider(
     openai_model: str = "gpt-4.1-mini",
     openai_temperature: float = 0.1,
     sample_iter_factory: Callable[..., Iterable[PriceSample]] | None = None,
+    fresh_data_provider: Callable[[str], Dict[str, Any] | None] | None = None,
 ) -> Iterator[TriggeredInsiderAssessment]:
     """
     Run insider_model only when a spike or informed-flow signal is detected.
@@ -360,6 +372,14 @@ def monitor_event_and_assess_insider(
             trigger_type = "whale_spike"
             trigger_payload = _spike_trigger_payload(spike)
 
+        if fresh_data_provider is not None:
+            fresh_market_data = fresh_data_provider(event_id)
+        else:
+            fresh_market_data = fetch_fresh_market_data_from_api(
+                event_id,
+                base_url=base_url,
+            )
+
         assessment = assess_insider_probability_for_event(
             event_id=event_id,
             base_url=base_url,
@@ -371,6 +391,7 @@ def monitor_event_and_assess_insider(
                 "trigger_type": trigger_type,
                 "trigger_payload": trigger_payload,
             },
+            fresh_market_data=fresh_market_data,
         )
         yield TriggeredInsiderAssessment(
             event_id=event_id,
@@ -381,18 +402,101 @@ def monitor_event_and_assess_insider(
         )
 
 
+def monitor_events_and_assess_insider(
+    event_ids: List[str],
+    *,
+    base_url: str,
+    interval_seconds: float = 5.0,
+    min_abs_change: float = 0.1,
+    min_rel_change: float = 0.3,
+    news_path: str = "data/news_events.jsonl",
+    min_news_lead_minutes: float = 5.0,
+    news_window_minutes: float = 240.0,
+    openai_model: str = "gpt-4.1-mini",
+    openai_temperature: float = 0.1,
+    sample_iter_factory: Callable[..., Iterable[PriceSample]] | None = None,
+    fresh_data_provider: Callable[[str], Dict[str, Any] | None] | None = None,
+) -> Iterator[TriggeredInsiderAssessment]:
+    """
+    Concurrently monitor multiple events and yield insider assessments.
+
+    Spawns one daemon thread per event_id, each running
+    `monitor_event_and_assess_insider`. Results from all threads are
+    collected in a shared queue and yielded in arrival order.
+
+    The iterator runs until all threads exit (which only happens if the
+    underlying generators are finite, e.g. in tests). In production the
+    threads are infinite loops, so this iterator also runs indefinitely
+    until the process is killed.
+    """
+    if not event_ids:
+        return
+
+    result_queue: queue.Queue[TriggeredInsiderAssessment] = queue.Queue()
+
+    def _worker(eid: str) -> None:
+        try:
+            for result in monitor_event_and_assess_insider(
+                eid,
+                base_url=base_url,
+                interval_seconds=interval_seconds,
+                min_abs_change=min_abs_change,
+                min_rel_change=min_rel_change,
+                news_path=news_path,
+                min_news_lead_minutes=min_news_lead_minutes,
+                news_window_minutes=news_window_minutes,
+                openai_model=openai_model,
+                openai_temperature=openai_temperature,
+                sample_iter_factory=sample_iter_factory,
+                fresh_data_provider=fresh_data_provider,
+            ):
+                result_queue.put(result)
+        except Exception as exc:
+            print(f"[whale-tracking] Worker for event {eid} exited with error: {exc}")
+
+    threads = [
+        threading.Thread(target=_worker, args=(eid,), daemon=True)
+        for eid in event_ids
+    ]
+    for t in threads:
+        t.start()
+
+    while any(t.is_alive() for t in threads):
+        try:
+            yield result_queue.get(timeout=1.0)
+        except queue.Empty:
+            continue
+
+    # Drain any results that arrived after the last is_alive() check.
+    while not result_queue.empty():
+        yield result_queue.get_nowait()
+
+
 if __name__ == "__main__":
-    # Minimal CLI for manual experimentation:
-    # python -m model.insider_detection EVENT_ID
+    # CLI usage:
+    # python -m model.insider_detection 2890
+    # python -m model.insider_detection 2890 3100 4200 --interval 30
+    # python -m model.insider_detection --all-events --interval 30
     import argparse
     import os
 
+    from database.events import get_all_event_ids
     from .event_prices import DEFAULT_BASE_URL
 
     parser = argparse.ArgumentParser(
-        description="Monitor a Polymarket event for large price jumps (whale spikes)."
+        description="Monitor one or more Polymarket events for large price jumps (whale spikes)."
     )
-    parser.add_argument("event_id", help="Polymarket event ID, e.g. 2890")
+    parser.add_argument(
+        "event_ids",
+        nargs="*",
+        help="One or more Polymarket event IDs, e.g. 2890 3100 4200. Omit when using --all-events.",
+    )
+    parser.add_argument(
+        "--all-events",
+        action="store_true",
+        default=False,
+        help="Load all event IDs from the database and monitor them all.",
+    )
     parser.add_argument(
         "--base-url",
         default=os.getenv("POLYMARKET_API_BASE", DEFAULT_BASE_URL),
@@ -401,8 +505,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--interval",
         type=float,
-        default=60.0,
-        help="Polling interval in seconds (default: 60).",
+        default=5.0,
+        help="Polling interval in seconds per event (default: 5.0).",
     )
     parser.add_argument(
         "--min-abs",
@@ -447,14 +551,25 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    if args.all_events:
+        event_ids = get_all_event_ids()
+        if not event_ids:
+            print("[whale-tracking] No events found in the database. Run 'python -m model.event_cache' first.")
+            raise SystemExit(1)
+    elif args.event_ids:
+        event_ids = args.event_ids
+    else:
+        parser.error("Provide at least one event ID or pass --all-events.")
+
     print(
-        f"[whale-tracking] Monitoring event {args.event_id} "
+        f"[whale-tracking] Monitoring {len(event_ids)} event(s): "
+        f"{', '.join(event_ids[:5])}{'...' if len(event_ids) > 5 else ''} "
         f"via {args.base_url} every {args.interval:.0f}s "
         f"(min_abs={args.min_abs}, min_rel={args.min_rel})"
     )
 
-    for result in monitor_event_and_assess_insider(
-        args.event_id,
+    for result in monitor_events_and_assess_insider(
+        event_ids,
         base_url=args.base_url,
         interval_seconds=args.interval,
         min_abs_change=args.min_abs,
