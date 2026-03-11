@@ -21,7 +21,13 @@ from config import CLOB_API, DATA_API, GAMMA_API
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    # Larger pool so many concurrent proxy requests (e.g. from insider_detection --all-events)
+    # do not hit PoolTimeout waiting for a free connection to Gamma/Data/CLOB.
+    limits = httpx.Limits(
+        max_connections=500,
+        max_keepalive_connections=100,
+    )
+    async with httpx.AsyncClient(timeout=30.0, limits=limits) as client:
         app.state.http = client
         yield
 

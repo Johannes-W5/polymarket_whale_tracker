@@ -13,6 +13,19 @@ def _event_get(event: Any, key: str, default: Any = None) -> Any:
     return getattr(event, key, default)
 
 
+def _is_event_active(event: Any) -> bool:
+    """
+    Treat an event as monitorable only when it is explicitly active and not closed.
+
+    Gamma's `active` flag alone is not sufficient because some closed/resolved
+    events still report `active=True`, but `active=False` should still exclude
+    the event from storage/monitoring.
+    """
+    active_raw = _event_get(event, "active")
+    closed_raw = _event_get(event, "closed", False)
+    return bool(active_raw) and not bool(closed_raw)
+
+
 def _normalize_event_for_db(event: Any) -> SimpleNamespace:
     event_id = _event_get(event, "id")
     if event_id is None:
@@ -30,11 +43,7 @@ def _normalize_event_for_db(event: Any) -> SimpleNamespace:
         or _event_get(event, "createdAt")
         or datetime.utcnow()
     )
-    # An event is considered active only if it is not closed.
-    # The Gamma API's own `active` field is unreliable (returns True even for
-    # resolved/closed events), so we use `closed=False` as the definitive signal.
-    closed = bool(_event_get(event, "closed", False))
-    active = not closed
+    active = _is_event_active(event)
     return SimpleNamespace(
         id=str(event_id),
         name=str(name),

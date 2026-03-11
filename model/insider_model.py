@@ -55,6 +55,18 @@ class InsiderAssessment:
     short_summary: str
 
 
+def _parse_iso8601_utc(value: Any) -> datetime | None:
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def _get_openai_client(api_key: Optional[str] = None) -> OpenAI:
     key = api_key or os.getenv("OPENAI_API_KEY")
     if not key:
@@ -89,19 +101,26 @@ def _fetch_event_db(event_id: str) -> Dict[str, Any] | None:
     # psycopg2 RealDictRow behaves like a mapping, normalize to plain dict.
     try:
         return dict(event)
-    except Exception:
+    except Exception as exc:
+        print(f"[insider-model] Failed to normalize event from DB: {exc}", flush=True)
         return None
+
+
+def _is_event_active(event: Dict[str, Any]) -> bool:
+    return bool(event.get("active")) and not bool(event.get("closed", False))
 
 
 def _cache_event_in_db(event: Dict[str, Any]) -> None:
     """
     Best-effort cache of slow-changing event metadata in PostgreSQL.
     """
+    if not _is_event_active(event):
+        return
     try:
         insert_event_to_db(event)
-    except Exception:
+    except Exception as exc:
         # Do not fail scoring if DB cache is temporarily unavailable.
-        pass
+        print(f"[insider-model] Failed to cache event in DB: {exc}", flush=True)
 
 
 def _fetch_recent_spikes_db(event_id: str, limit: int = 5) -> List[Dict[str, Any]]:
@@ -110,14 +129,16 @@ def _fetch_recent_spikes_db(event_id: str, limit: int = 5) -> List[Dict[str, Any
     """
     try:
         rows = get_recent_whale_spikes(event_id, limit=limit) or []
-    except Exception:
+    except Exception as exc:
+        print(f"[insider-model] Failed to fetch recent whale spikes for event {event_id}: {exc}", flush=True)
         return []
 
     result: List[Dict[str, Any]] = []
     for row in rows:
         try:
             result.append(dict(row))
-        except Exception:
+        except Exception as exc:
+            print(f"[insider-model] Failed to convert spike row to dict: {exc}", flush=True)
             continue
     return result
 
@@ -162,6 +183,39 @@ def _isoformat(dt: datetime | None) -> Optional[str]:
     return dt.astimezone(timezone.utc).isoformat()
 
 
+def _resolve_signal_time(
+    trigger_context: Dict[str, Any] | None,
+    fresh_market_data: Dict[str, Any] | None,
+) -> tuple[datetime, str]:
+    """
+    Pick the timestamp that best represents when the suspicious activity happened.
+
+    Preference order:
+    1. Explicit trigger timestamp passed by caller.
+    2. Trigger payload spike end timestamp (`to_ts`) from insider_detection.
+    3. Fresh market-data capture time near the trigger.
+    4. Current time as a last-resort fallback.
+    """
+    if isinstance(trigger_context, dict):
+        explicit_signal_time = _parse_iso8601_utc(trigger_context.get("signal_time"))
+        if explicit_signal_time is not None:
+            return explicit_signal_time, "trigger_context.signal_time"
+
+        trigger_payload = trigger_context.get("trigger_payload")
+        if isinstance(trigger_payload, dict):
+            for key in ("to_ts", "captured_at", "timestamp", "triggered_at"):
+                parsed = _parse_iso8601_utc(trigger_payload.get(key))
+                if parsed is not None:
+                    return parsed, f"trigger_context.trigger_payload.{key}"
+
+    if isinstance(fresh_market_data, dict):
+        fresh_captured_at = _parse_iso8601_utc(fresh_market_data.get("captured_at"))
+        if fresh_captured_at is not None:
+            return fresh_captured_at, "fresh_market_data.captured_at"
+
+    return datetime.now(timezone.utc), "generated_at_fallback"
+
+
 def _build_feature_payload(
     event_id: str,
     *,
@@ -195,16 +249,18 @@ def _build_feature_payload(
         base_url=base_url,
     )
 
-    # For news timing we use "now" as the signal time by default; callers
-    # can override later if needed.
     now_utc = datetime.now(timezone.utc)
     fresh_data = fresh_market_data or fetch_fresh_market_data_from_api(
         event_id,
         base_url=base_url,
     )
+    signal_time, signal_time_source = _resolve_signal_time(
+        trigger_context,
+        fresh_data,
+    )
     news_timing: Optional[NewsTiming] = find_nearest_news_for_event(
         event_id,
-        signal_time=now_utc,
+        signal_time=signal_time,
         base_url=base_url,
         news_path=news_path,
     )
@@ -217,6 +273,19 @@ def _build_feature_payload(
         "event_db": event_db,
         "recent_whale_spikes_db": recent_spikes_db,
         "generated_at": _isoformat(now_utc),
+        "signal_time_for_news": _isoformat(signal_time),
+        "signal_time_source": signal_time_source,
+        "news_timing_interpretation": {
+            "signal_time_definition": (
+                "Approximate time when the suspicious trade/spike/trigger happened."
+            ),
+            "positive_delta_minutes_means": (
+                "News arrived after the signal time, so trading/spike happened before news."
+            ),
+            "negative_delta_minutes_means": (
+                "News arrived before the signal time, so trading/spike happened after news."
+            ),
+        },
         "fresh_market_data": fresh_data,
         "volume_stats": asdict(volume),
         "orderbook_imbalance": _asdict_list(orderbooks),
@@ -246,6 +315,13 @@ def _build_prompt(features: Dict[str, Any]) -> str:
         "depth and imbalance, changes in open interest, abnormal price history "
         "patterns (e.g. outlier moves vs recent volatility), and the timing of "
         "relevant news.\n\n"
+        "When interpreting `news_timing`, compare the news timestamp to the "
+        "provided signal/trigger time rather than the assessment runtime. "
+        "DO NOT treat positive `delta_minutes` as evidence that suspicious activity, just disregard news and timing of news for now completely " #Treat positive `delta_minutes` as evidence that suspicious activity 
+        "happened before the relevant news, and negative `delta_minutes` as "
+        "evidence that suspicious activity happened after the news. Post-news "
+        "activity is usually less indicative of insider trading than pre-news "
+        "activity, all else equal.\n\n"
         "You will receive a JSON object with event metadata and derived signals:\n"
         f"{features_json}\n\n"
         "Return ONLY a single JSON object with the following fields:\n"

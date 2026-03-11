@@ -15,6 +15,10 @@ from database.connection import get_connection
 from .event_prices import DEFAULT_BASE_URL
 
 
+def _is_event_active(event: Dict[str, Any]) -> bool:
+    return bool(event.get("active")) and not bool(event.get("closed", False))
+
+
 def _reset_all_events_inactive() -> None:
     """Mark every event in the DB as inactive before a fresh sync."""
     with closing(get_connection()) as conn, conn.cursor() as cur:
@@ -32,12 +36,17 @@ def fetch_events_page(
     retry_delay: float = 5.0,
 ) -> List[Dict[str, Any]]:
     """
-    Fetch a page of events from the local proxy.
+    Fetch a page of current active events from the local proxy.
 
     Retries up to `retries` times on 5xx errors before giving up.
     """
     base = base_url.rstrip("/")
-    params = {"limit": max(1, min(int(limit), 1000)), "offset": max(0, int(offset))}
+    params = {
+        "limit": max(1, min(int(limit), 1000)),
+        "offset": max(0, int(offset)),
+        "active": "true",
+        "closed": "false",
+    }
     last_exc: Exception | None = None
     for attempt in range(max(1, retries)):
         try:
@@ -46,7 +55,11 @@ def fetch_events_page(
                 r.raise_for_status()
                 payload = r.json()
             if isinstance(payload, list):
-                return [e for e in payload if isinstance(e, dict)]
+                return [
+                    e
+                    for e in payload
+                    if isinstance(e, dict) and _is_event_active(e)
+                ]
             return []
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code < 500:
@@ -81,29 +94,43 @@ def sync_events_to_db(
 
     Uses a mark-and-sweep strategy:
     1. All existing events are reset to active=FALSE.
-    2. Pages are fetched from the API and upserted; only non-closed events
-       come back as active=TRUE (via _normalize_event_for_db).
-    3. Any event not returned by the API (deleted upstream) stays inactive.
+    2. Pages of active, non-closed events are fetched from the API and upserted.
+    3. Any event not returned by the API stays inactive.
 
     Returns number of upserted rows.
     """
-    _reset_all_events_inactive()
     total = 0
+    try:
+        first_page = fetch_events_page(
+            base_url=base_url,
+            limit=page_size,
+            offset=0,
+            timeout=timeout,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"initial event-cache fetch failed: {exc}") from exc
+
+    _reset_all_events_inactive()
     for page in range(max(1, int(max_pages))):
         offset = page * page_size
-        try:
-            events = fetch_events_page(
-                base_url=base_url,
-                limit=page_size,
-                offset=offset,
-                timeout=timeout,
-            )
-        except Exception as exc:
-            print(f"[event-cache] Skipping page at offset={offset}: {exc}")
-            continue
+        if page == 0:
+            events = first_page
+        else:
+            try:
+                events = fetch_events_page(
+                    base_url=base_url,
+                    limit=page_size,
+                    offset=offset,
+                    timeout=timeout,
+                )
+            except Exception as exc:
+                print(f"[event-cache] Skipping page at offset={offset}: {exc}")
+                continue
         if not events:
             break
         for event in events:
+            if not _is_event_active(event):
+                continue
             insert_event(event)
             total += 1
         if len(events) < page_size:

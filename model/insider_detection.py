@@ -25,12 +25,18 @@ Try to fetch not only one event but all events in the database. Create database 
 
 from database.events import insert_whale_spike
 
+import httpx
 import queue
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from time import sleep
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
+
+DEFAULT_MIN_ABS_CHANGE = 0.03
+DEFAULT_MIN_REL_CHANGE = 0.08
+ALL_EVENTS_MIN_ABS_CHANGE = 0.05
+ALL_EVENTS_MIN_REL_CHANGE = 0.10
 
 # Support both "python -m model.insider_detection" (package context)
 # and direct execution "python model/insider_detection.py".
@@ -117,12 +123,28 @@ class TriggeredInsiderAssessment:
     assessment: InsiderAssessment
 
 
+def _event_is_currently_active(
+    event_id: str,
+    *,
+    base_url: str,
+    timeout: float = 30.0,
+) -> bool:
+    base = base_url.rstrip("/")
+    with httpx.Client(timeout=timeout) as client:
+        r = client.get(f"{base}/events/{event_id}")
+        r.raise_for_status()
+        event = r.json()
+    if not isinstance(event, dict):
+        return False
+    return bool(event.get("active")) and not bool(event.get("closed", False))
+
+
 def detect_spike_between(
     prev_sample: PriceSample,
     curr_sample: PriceSample,
     *,
-    min_abs_change: float = 0.01,
-    min_rel_change: float = 0.01, #change to 0.3 for more sensitive detection again
+    min_abs_change: float = DEFAULT_MIN_ABS_CHANGE,
+    min_rel_change: float = DEFAULT_MIN_REL_CHANGE,
 ) -> list[WhaleSpike]:
     """
     Detect price spikes between two samples for an event.
@@ -177,7 +199,7 @@ def iter_price_samples(
             prices = get_event_prices(event_id, base_url=base_url, side=side)
             yield PriceSample.from_event_prices(event_id, prices)
         except Exception as exc:
-            print(f"[whale-tracking] Skipping sample for event {event_id}: {exc}")
+            print(f"[whale-tracking] Skipping sample for event {event_id}: {exc}", flush=True)
         sleep(interval_seconds)
 
 
@@ -186,8 +208,8 @@ def monitor_event_for_spikes(
     *,
     base_url: str,
     interval_seconds: float = 5.0,
-    min_abs_change: float = 0.01, 
-    min_rel_change: float = 0.01, #change to 0.3 again for more sensitive detection
+    min_abs_change: float = DEFAULT_MIN_ABS_CHANGE,
+    min_rel_change: float = DEFAULT_MIN_REL_CHANGE,
     sample_iter_factory: Callable[..., Iterable[PriceSample]] | None = None,
 ) -> Iterator[WhaleSpike]:
     """
@@ -267,8 +289,8 @@ def monitor_event_for_informed_flow(
     *,
     base_url: str,
     interval_seconds: float = 5.0,
-    min_abs_change: float = 0.01,
-    min_rel_change: float = 0.01, #change to 0.3 again for more sensitive detection
+    min_abs_change: float = DEFAULT_MIN_ABS_CHANGE,
+    min_rel_change: float = DEFAULT_MIN_REL_CHANGE,
     news_path: str = "data/news_events.jsonl",
     min_news_lead_minutes: float = 5.0,
     news_window_minutes: float = 240.0,
@@ -333,8 +355,8 @@ def monitor_event_and_assess_insider(
     *,
     base_url: str,
     interval_seconds: float = 5.0,
-    min_abs_change: float = 0.01,
-    min_rel_change: float = 0.01, #change to 0.3 again for more sensitive detection
+    min_abs_change: float = DEFAULT_MIN_ABS_CHANGE,
+    min_rel_change: float = DEFAULT_MIN_REL_CHANGE,
     news_path: str = "data/news_events.jsonl",
     min_news_lead_minutes: float = 5.0,
     news_window_minutes: float = 240.0,
@@ -342,10 +364,15 @@ def monitor_event_and_assess_insider(
     openai_temperature: float = 0.1,
     sample_iter_factory: Callable[..., Iterable[PriceSample]] | None = None,
     fresh_data_provider: Callable[[str], Dict[str, Any] | None] | None = None,
+    skip_active_check: bool = False,
 ) -> Iterator[TriggeredInsiderAssessment]:
     """
     Run insider_model only when a spike or informed-flow signal is detected.
     """
+    if not skip_active_check and not _event_is_currently_active(event_id, base_url=base_url):
+        print(f"[whale-tracking] Skipping inactive event {event_id}.", flush=True)
+        return
+
     for spike in monitor_event_for_spikes(
         event_id,
         base_url=base_url,
@@ -406,8 +433,8 @@ def monitor_events_and_assess_insider(
     *,
     base_url: str,
     interval_seconds: float = 5.0,
-    min_abs_change: float = 0.01,
-    min_rel_change: float = 0.01, #change to 0.3 again for more sensitive detection
+    min_abs_change: float = DEFAULT_MIN_ABS_CHANGE,
+    min_rel_change: float = DEFAULT_MIN_REL_CHANGE,
     news_path: str = "data/news_events.jsonl",
     min_news_lead_minutes: float = 5.0,
     news_window_minutes: float = 240.0,
@@ -415,6 +442,7 @@ def monitor_events_and_assess_insider(
     openai_temperature: float = 0.1,
     sample_iter_factory: Callable[..., Iterable[PriceSample]] | None = None,
     fresh_data_provider: Callable[[str], Dict[str, Any] | None] | None = None,
+    skip_active_check: bool = False,
 ) -> Iterator[TriggeredInsiderAssessment]:
     """
     Concurrently monitor multiple events and yield insider assessments.
@@ -448,10 +476,11 @@ def monitor_events_and_assess_insider(
                 openai_temperature=openai_temperature,
                 sample_iter_factory=sample_iter_factory,
                 fresh_data_provider=fresh_data_provider,
+                skip_active_check=skip_active_check,
             ):
                 result_queue.put(result)
         except Exception as exc:
-            print(f"[whale-tracking] Worker for event {eid} exited with error: {exc}")
+            print(f"[whale-tracking] Worker for event {eid} exited with error: {exc}", flush=True)
 
     threads = [
         threading.Thread(target=_worker, args=(eid,), daemon=True)
@@ -478,6 +507,11 @@ if __name__ == "__main__":
     # python -m model.insider_detection --all-events --interval 30
     import argparse
     import os
+    import sys
+
+    # Ensure console output appears immediately (no buffering).
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
 
     from database.events import get_all_event_ids
     from .event_prices import DEFAULT_BASE_URL
@@ -510,14 +544,22 @@ if __name__ == "__main__":
     parser.add_argument(
         "--min-abs",
         type=float,
-        default=0.01,
-        help="Minimum absolute price change to flag a spike (default: 0.1).",
+        default=None,
+        help=(
+            "Minimum absolute price change to flag a spike "
+            f"(default: {DEFAULT_MIN_ABS_CHANGE:.2f}; "
+            f"{ALL_EVENTS_MIN_ABS_CHANGE:.2f} with --all-events)."
+        ),
     )
     parser.add_argument( 
         "--min-rel",
         type=float,
-        default=0.01, #change to 0.3 again for more sensitive detection
-        help="Minimum relative price change (fraction, default: 0.3 == 30%%).",
+        default=None,
+        help=(
+            "Minimum relative price change as a fraction "
+            f"(default: {DEFAULT_MIN_REL_CHANGE:.2f}; "
+            f"{ALL_EVENTS_MIN_REL_CHANGE:.2f} with --all-events)."
+        ),
     )
     parser.add_argument(
         "--news-path",
@@ -553,18 +595,37 @@ if __name__ == "__main__":
     if args.all_events:
         event_ids = get_all_event_ids()
         if not event_ids:
-            print("[whale-tracking] No events found in the database. Run 'python -m model.event_cache' first.")
+            print("[whale-tracking] No events found in the database. Run 'python -m model.event_cache' first.", flush=True)
             raise SystemExit(1)
     elif args.event_ids:
         event_ids = args.event_ids
     else:
         parser.error("Provide at least one event ID or pass --all-events.")
 
+    if args.min_abs is None:
+        args.min_abs = (
+            ALL_EVENTS_MIN_ABS_CHANGE if args.all_events else DEFAULT_MIN_ABS_CHANGE
+        )
+    if args.min_rel is None:
+        args.min_rel = (
+            ALL_EVENTS_MIN_REL_CHANGE if args.all_events else DEFAULT_MIN_REL_CHANGE
+        )
+
+    # With --all-events, IDs already come from the DB (active=TRUE from event_cache).
+    # Skip per-event API validation to avoid 8000+ requests and ~30 min startup.
+    if not args.all_events:
+        event_ids = [
+            event_id
+            for event_id in event_ids
+            if _event_is_currently_active(event_id, base_url=args.base_url)
+        ]
+    if not event_ids:
+        print("[whale-tracking] No active events available to monitor.", flush=True)
+        raise SystemExit(1)
+
     print(
-        f"[whale-tracking] Monitoring {len(event_ids)} event(s): "
-        f"{', '.join(event_ids[:5])}{'...' if len(event_ids) > 5 else ''} "
-        f"via {args.base_url} every {args.interval:.0f}s "
-        f"(min_abs={args.min_abs}, min_rel={args.min_rel})"
+        f"Monitoring {len(event_ids)} event(s). OpenAI assessments will appear below when spikes are detected.",
+        flush=True,
     )
 
     for result in monitor_events_and_assess_insider(
@@ -578,32 +639,40 @@ if __name__ == "__main__":
         news_window_minutes=args.news_window,
         openai_model=args.openai_model,
         openai_temperature=args.openai_temperature,
+        skip_active_check=args.all_events,
     ):
-        spike = result.spike
-        direction = "UP" if spike.abs_change > 0 else "DOWN"
+        # Testing: only show OpenAI API assessment (probability, confidence, summary).
+        a = result.assessment
         print(
-            "[whale-spike]",
-            spike.event_id,
-            spike.side,
-            direction,
-            f"{spike.from_price:.3f} -> {spike.to_price:.3f}",
-            f"(Δ={spike.abs_change:+.3f}, rel={spike.rel_change*100:.1f}%)",
-            f"window={int((spike.to_ts - spike.from_ts).total_seconds())}s",
+            f"[OpenAI] event_id={result.event_id} "
+            f"probability_insider={a.probability_insider:.3f} "
+            f"confidence={a.confidence} "
+            f"summary={a.short_summary}",
+            flush=True,
         )
-        if result.informed_flow is not None:
-            print(
-                "[informed-flow?]",
-                result.informed_flow.event_id,
-                f"lead={result.informed_flow.lead_minutes:.1f}m",
-                f"source={result.informed_flow.news_source}",
-                f"title={result.informed_flow.news_title}",
-            )
-        print(
-            "[insider-assessment]",
-            result.event_id,
-            f"trigger={result.trigger_type}",
-            f"prob={result.assessment.probability_insider:.3f}",
-            f"confidence={result.assessment.confidence}",
-            f"summary={result.assessment.short_summary}",
-        )
+        # print(
+        #     "[whale-spike]",
+        #     spike.event_id,
+        #     spike.side,
+        #     direction,
+        #     f"{spike.from_price:.3f} -> {spike.to_price:.3f}",
+        #     f"(Δ={spike.abs_change:+.3f}, rel={spike.rel_change*100:.1f}%)",
+        #     f"window={int((spike.to_ts - spike.from_ts).total_seconds())}s",
+        # )
+        # if result.informed_flow is not None:
+        #     print(
+        #         "[informed-flow?]",
+        #         result.informed_flow.event_id,
+        #         f"lead={result.informed_flow.lead_minutes:.1f}m",
+        #         f"source={result.informed_flow.news_source}",
+        #         f"title={result.informed_flow.news_title}",
+        #     )
+        # print(
+        #     "[insider-assessment]",
+        #     result.event_id,
+        #     f"trigger={result.trigger_type}",
+        #     f"prob={result.assessment.probability_insider:.3f}",
+        #     f"confidence={result.assessment.confidence}",
+        #     f"summary={result.assessment.short_summary}",
+        # )
 
