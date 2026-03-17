@@ -204,6 +204,12 @@ def _fetch_order_book(
     base = _base_url(base_url)
     with httpx.Client(timeout=timeout) as client:
         r = client.get(f"{base}/book", params={"token_id": token_id})
+        if r.status_code in (400, 404):
+            print(
+                f"[market-signals] No usable order book for token {token_id}: {r.status_code}",
+                flush=True,
+            )
+            return {}
         r.raise_for_status()
         data = r.json()
     return data if isinstance(data, dict) else {}
@@ -241,14 +247,22 @@ def compute_orderbook_imbalance_for_event(
         bids = book.get("bids") or []
         asks = book.get("asks") or []
 
-        def _depth(levels: Sequence[Sequence[Any]]) -> float:
+        def _depth(levels: Sequence[Any]) -> float:
             depth = 0.0
             for lvl in list(levels)[:max_levels]:
-                if len(lvl) < 2:
-                    continue
                 try:
-                    size = float(lvl[1])
-                except (TypeError, ValueError):
+                    if isinstance(lvl, dict):
+                        raw_size = (
+                            lvl.get("size")
+                            or lvl.get("quantity")
+                            or lvl.get("amount")
+                        )
+                    elif len(lvl) >= 2:
+                        raw_size = lvl[1]
+                    else:
+                        continue
+                    size = float(raw_size)
+                except (TypeError, ValueError, KeyError):
                     continue
                 depth += max(size, 0.0)
             return depth
@@ -396,6 +410,12 @@ def _fetch_price_history(
         params["endTs"] = int(end_ts)
     with httpx.Client(timeout=timeout) as client:
         r = client.get(f"{base}/prices-history", params=params)
+        if r.status_code in (400, 404):
+            print(
+                f"[market-signals] No usable price history for market {market_id}: {r.status_code}",
+                flush=True,
+            )
+            return []
         r.raise_for_status()
         payload = r.json()
 

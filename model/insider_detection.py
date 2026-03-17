@@ -26,8 +26,14 @@ Try to fetch not only one event but all events in the database. Create database 
 from database.events import insert_whale_spike
 
 import httpx
+import os
 import queue
 import threading
+
+try:
+    from openai import RateLimitError as OpenAIRateLimitError
+except ImportError:
+    OpenAIRateLimitError = None  # type: ignore[misc, assignment]
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from time import sleep
@@ -37,6 +43,8 @@ DEFAULT_MIN_ABS_CHANGE = 0.03
 DEFAULT_MIN_REL_CHANGE = 0.08
 ALL_EVENTS_MIN_ABS_CHANGE = 0.05
 ALL_EVENTS_MIN_REL_CHANGE = 0.10
+DEFAULT_ASSESSMENT_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:cloud")
+DEFAULT_ASSESSMENT_TEMPERATURE = 0.1
 
 # Support both "python -m model.insider_detection" (package context)
 # and direct execution "python model/insider_detection.py".
@@ -187,6 +195,7 @@ def iter_price_samples(
     base_url: str,
     interval_seconds: float = 5.0,
     side: str = "BUY",
+    request_timeout: float = 30.0,
 ) -> Iterator[PriceSample]:
     """
     Infinite iterator of price samples for an event, polling the server API.
@@ -196,7 +205,12 @@ def iter_price_samples(
     """
     while True:
         try:
-            prices = get_event_prices(event_id, base_url=base_url, side=side)
+            prices = get_event_prices(
+                event_id,
+                base_url=base_url,
+                side=side,
+                timeout=request_timeout,
+            )
             yield PriceSample.from_event_prices(event_id, prices)
         except Exception as exc:
             print(f"[whale-tracking] Skipping sample for event {event_id}: {exc}", flush=True)
@@ -211,6 +225,7 @@ def monitor_event_for_spikes(
     min_abs_change: float = DEFAULT_MIN_ABS_CHANGE,
     min_rel_change: float = DEFAULT_MIN_REL_CHANGE,
     sample_iter_factory: Callable[..., Iterable[PriceSample]] | None = None,
+    request_timeout: float = 30.0,
 ) -> Iterator[WhaleSpike]:
     """
     High-level helper: continuously monitor an event and yield detected spikes.
@@ -231,6 +246,7 @@ def monitor_event_for_spikes(
         event_id,
         base_url=base_url,
         interval_seconds=interval_seconds,
+        request_timeout=request_timeout,
     ):
         if prev_sample is not None:
             spikes = detect_spike_between(
@@ -360,11 +376,12 @@ def monitor_event_and_assess_insider(
     news_path: str = "data/news_events.jsonl",
     min_news_lead_minutes: float = 5.0,
     news_window_minutes: float = 240.0,
-    openai_model: str = "gpt-4.1-mini",
-    openai_temperature: float = 0.1,
+    openai_model: str = DEFAULT_ASSESSMENT_MODEL,
+    openai_temperature: float = DEFAULT_ASSESSMENT_TEMPERATURE,
     sample_iter_factory: Callable[..., Iterable[PriceSample]] | None = None,
     fresh_data_provider: Callable[[str], Dict[str, Any] | None] | None = None,
     skip_active_check: bool = False,
+    request_timeout: float = 30.0,
 ) -> Iterator[TriggeredInsiderAssessment]:
     """
     Run insider_model only when a spike or informed-flow signal is detected.
@@ -380,6 +397,7 @@ def monitor_event_and_assess_insider(
         min_abs_change=min_abs_change,
         min_rel_change=min_rel_change,
         sample_iter_factory=sample_iter_factory,
+        request_timeout=request_timeout,
     ):
         # Persist each detected spike for downstream querying/auditing.
         insert_whale_spike(spike)
@@ -406,19 +424,36 @@ def monitor_event_and_assess_insider(
                 base_url=base_url,
             )
 
-        assessment = assess_insider_probability_for_event(
-            event_id=event_id,
-            base_url=base_url,
-            model=openai_model,
-            news_path=news_path,
-            temperature=openai_temperature,
-            include_db_event=True,
-            trigger_context={
-                "trigger_type": trigger_type,
-                "trigger_payload": trigger_payload,
-            },
-            fresh_market_data=fresh_market_data,
-        )
+        try:
+            assessment = assess_insider_probability_for_event(
+                event_id=event_id,
+                base_url=base_url,
+                model=openai_model,
+                news_path=news_path,
+                temperature=openai_temperature,
+                include_db_event=True,
+                trigger_context={
+                    "trigger_type": trigger_type,
+                    "trigger_payload": trigger_payload,
+                },
+                fresh_market_data=fresh_market_data,
+            )
+        except Exception as api_err:
+            if OpenAIRateLimitError is not None and isinstance(api_err, OpenAIRateLimitError):
+                err_body = getattr(api_err, "body", None) or {}
+                if isinstance(err_body, dict) and err_body.get("error", {}).get("type") == "insufficient_quota":
+                    print(
+                        "[whale-tracking] OpenAI quota exceeded (429). Add credits at https://platform.openai.com/account/billing. Skipping assessment for this spike.",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "[whale-tracking] OpenAI rate limit (429). Skipping assessment for this spike; will retry on next.",
+                        flush=True,
+                    )
+                continue
+            raise
+
         yield TriggeredInsiderAssessment(
             event_id=event_id,
             trigger_type=trigger_type,
@@ -438,11 +473,12 @@ def monitor_events_and_assess_insider(
     news_path: str = "data/news_events.jsonl",
     min_news_lead_minutes: float = 5.0,
     news_window_minutes: float = 240.0,
-    openai_model: str = "gpt-4.1-mini",
-    openai_temperature: float = 0.1,
+    openai_model: str = DEFAULT_ASSESSMENT_MODEL,
+    openai_temperature: float = DEFAULT_ASSESSMENT_TEMPERATURE,
     sample_iter_factory: Callable[..., Iterable[PriceSample]] | None = None,
     fresh_data_provider: Callable[[str], Dict[str, Any] | None] | None = None,
     skip_active_check: bool = False,
+    request_timeout: float = 30.0,
 ) -> Iterator[TriggeredInsiderAssessment]:
     """
     Concurrently monitor multiple events and yield insider assessments.
@@ -477,10 +513,12 @@ def monitor_events_and_assess_insider(
                 sample_iter_factory=sample_iter_factory,
                 fresh_data_provider=fresh_data_provider,
                 skip_active_check=skip_active_check,
+                request_timeout=request_timeout,
             ):
                 result_queue.put(result)
         except Exception as exc:
-            print(f"[whale-tracking] Worker for event {eid} exited with error: {exc}", flush=True)
+            exc_type = type(exc).__name__
+            print(f"[whale-tracking] Worker for event {eid} exited with error: {exc_type}: {exc}", flush=True)
 
     threads = [
         threading.Thread(target=_worker, args=(eid,), daemon=True)
@@ -506,7 +544,6 @@ if __name__ == "__main__":
     # python -m model.insider_detection 2890 3100 4200 --interval 30
     # python -m model.insider_detection --all-events --interval 30
     import argparse
-    import os
     import sys
 
     # Ensure console output appears immediately (no buffering).
@@ -580,14 +617,30 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--openai-model",
-        default="gpt-4.1-mini",
-        help="OpenAI model name used for insider assessment.",
+        "--ollama-model",
+        dest="openai_model",
+        default=os.getenv("OLLAMA_MODEL", DEFAULT_ASSESSMENT_MODEL),
+        help="Ollama Cloud model name used for insider assessment.",
     )
     parser.add_argument(
         "--openai-temperature",
+        "--ollama-temperature",
+        dest="openai_temperature",
         type=float,
-        default=0.1,
-        help="OpenAI sampling temperature for insider assessment.",
+        default=DEFAULT_ASSESSMENT_TEMPERATURE,
+        help="Sampling temperature for insider assessment.",
+    )
+    parser.add_argument(
+        "--request-timeout",
+        type=float,
+        default=None,
+        help="HTTP timeout in seconds for price requests (default 30; 60 with --all-events).",
+    )
+    parser.add_argument(
+        "--max-events",
+        type=int,
+        default=50,
+        help="When using --all-events, monitor at most this many events (default 50).",
     )
 
     args = parser.parse_args()
@@ -597,6 +650,7 @@ if __name__ == "__main__":
         if not event_ids:
             print("[whale-tracking] No events found in the database. Run 'python -m model.event_cache' first.", flush=True)
             raise SystemExit(1)
+        event_ids = event_ids[: max(1, args.max_events)]
     elif args.event_ids:
         event_ids = args.event_ids
     else:
@@ -610,6 +664,8 @@ if __name__ == "__main__":
         args.min_rel = (
             ALL_EVENTS_MIN_REL_CHANGE if args.all_events else DEFAULT_MIN_REL_CHANGE
         )
+    if args.request_timeout is None:
+        args.request_timeout = 60.0 if args.all_events else 30.0
 
     # With --all-events, IDs already come from the DB (active=TRUE from event_cache).
     # Skip per-event API validation to avoid 8000+ requests and ~30 min startup.
@@ -624,7 +680,7 @@ if __name__ == "__main__":
         raise SystemExit(1)
 
     print(
-        f"Monitoring {len(event_ids)} event(s). OpenAI assessments will appear below when spikes are detected.",
+        f"Monitoring {len(event_ids)} event(s). Ollama assessments will appear below when spikes are detected.",
         flush=True,
     )
 
@@ -640,11 +696,12 @@ if __name__ == "__main__":
         openai_model=args.openai_model,
         openai_temperature=args.openai_temperature,
         skip_active_check=args.all_events,
+        request_timeout=args.request_timeout,
     ):
-        # Testing: only show OpenAI API assessment (probability, confidence, summary).
+        # Testing: only show model assessment (probability, confidence, summary).
         a = result.assessment
         print(
-            f"[OpenAI] event_id={result.event_id} "
+            f"[Ollama] event_id={result.event_id} "
             f"probability_insider={a.probability_insider:.3f} "
             f"confidence={a.confidence} "
             f"summary={a.short_summary}",
@@ -675,4 +732,3 @@ if __name__ == "__main__":
         #     f"confidence={result.assessment.confidence}",
         #     f"summary={result.assessment.short_summary}",
         # )
-

@@ -11,4 +11,4 @@ python -m model.insider_detection 2890 3100 --interval 5
 
 # monitor ALL active events from the database cache
 # defaults become stricter with --all-events: min_abs=0.05, min_rel=0.10
-python -m model.insider_detection --all-events --interval 10 (--all-events calls database/events.py with get_all_event_ids())
+python -m model.insider_detection --all-events --max-events 1000 (--all-events calls database/events.py with get_all_event_ids())

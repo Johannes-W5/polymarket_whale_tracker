@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 """
-OpenAI-based heuristic for detecting likely insider / informed trading.
+Ollama-based heuristic for detecting likely insider / informed trading.
 
 This module takes:
 - Polymarket event metadata (via the local proxy `/events/{id}`)
 - Derived market activity signals from `model.market_signals`
 
-and asks an OpenAI model to produce:
+and asks an Ollama model to produce:
 - A probability in [0, 1] that current activity is driven by materially
   informed / insider trading rather than ordinary speculative flow.
 - A short natural-language summary explaining the reasoning.
@@ -19,11 +19,10 @@ research / analytics signal.
 import json
 import os
 from dataclasses import dataclass, asdict
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import httpx
-from openai import OpenAI
 
 from database.events import (
     get_event as get_event_from_db,
@@ -48,7 +47,7 @@ from .market_signals import (
 
 @dataclass
 class InsiderAssessment:
-    """Structured result from the OpenAI insider-risk classifier."""
+    """Structured result from the Ollama insider-risk classifier."""
 
     probability_insider: float
     confidence: str
@@ -67,13 +66,27 @@ def _parse_iso8601_utc(value: Any) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def _get_openai_client(api_key: Optional[str] = None) -> OpenAI:
-    key = api_key or os.getenv("OPENAI_API_KEY")
-    if not key:
+def _get_ollama_config(
+    host: Optional[str] = None,
+    model: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> tuple[str, str, str]:
+    resolved_host = (host or os.getenv("OLLAMA_HOST") or "https://ollama.com").rstrip("/")
+    resolved_model = model or os.getenv("OLLAMA_MODEL") or "qwen3.5:cloud"
+    resolved_api_key = api_key or os.getenv("OLLAMA_API_KEY")
+    if not resolved_api_key:
         raise RuntimeError(
-            "OPENAI_API_KEY is not set. Please export it in your environment."
+            "OLLAMA_API_KEY is not set. Create a key at https://ollama.com/settings/keys "
+            "and export it before running cloud models."
         )
-    return OpenAI(api_key=key)
+    return resolved_host, resolved_model, resolved_api_key
+
+
+def _ollama_api_url(host: str, path: str) -> str:
+    base = host.rstrip("/")
+    if base.endswith("/api"):
+        return f"{base}/{path.lstrip('/')}"
+    return f"{base}/api/{path.lstrip('/')}"
 
 
 def _fetch_event_raw(
@@ -227,7 +240,7 @@ def _build_feature_payload(
 ) -> Dict[str, Any]:
     """
     Collect event metadata and derived signals into a single JSON-serialisable
-    payload to feed into the OpenAI model.
+    payload to feed into the Ollama model.
     """
     event_raw = _fetch_event_raw(event_id, base_url=base_url)
     _cache_event_in_db(event_raw)
@@ -297,11 +310,22 @@ def _build_feature_payload(
     return payload
 
 
+def _json_serial_default(obj: Any) -> Any:
+    """Convert non-JSON-serializable values for json.dumps (e.g. datetime from DB)."""
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    if isinstance(obj, date):
+        return obj.isoformat()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
 def _build_prompt(features: Dict[str, Any]) -> str:
     """
-    Build a single JSON-heavy prompt for the OpenAI model.
+    Build a single JSON-heavy prompt for the Ollama model.
     """
-    features_json = json.dumps(features, indent=2, sort_keys=True)
+    features_json = json.dumps(
+        features, indent=2, sort_keys=True, default=_json_serial_default
+    )
     return (
         "You are an expert quantitative analyst focused on prediction markets, "
         "order books, and market microstructure. You are given a Polymarket event "
@@ -336,12 +360,32 @@ def _build_prompt(features: Dict[str, Any]) -> str:
     )
 
 
+def _extract_json_object(text: str) -> Dict[str, Any]:
+    content = (text or "").strip()
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        start = content.find("{")
+        end = content.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise RuntimeError(
+                f"Ollama response was not valid JSON. Raw content was:\n{content}"
+            )
+        try:
+            return json.loads(content[start : end + 1])
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"Ollama response was not valid JSON. Raw content was:\n{content}"
+            ) from exc
+
+
 def assess_insider_probability_for_event(
     event_id: str,
     *,
     base_url: str = DEFAULT_BASE_URL,
-    openai_api_key: Optional[str] = None,
-    model: str = "gpt-4.1-mini",
+    ollama_host: Optional[str] = None,
+    ollama_api_key: Optional[str] = None,
+    model: Optional[str] = None,
     news_path: str = "data/news_events.jsonl",
     temperature: float = 0.1,
     include_db_event: bool = True,
@@ -349,13 +393,14 @@ def assess_insider_probability_for_event(
     fresh_market_data: Dict[str, Any] | None = None,
 ) -> InsiderAssessment:
     """
-    High-level helper: call OpenAI to estimate insider-trading likelihood.
+    High-level helper: call Ollama to estimate insider-trading likelihood.
 
     Args:
         event_id: Polymarket event ID.
         base_url: Base URL of your local Polymarket proxy (default 127.0.0.1:8000).
-        openai_api_key: Optional override; otherwise uses OPENAI_API_KEY env var.
-        model: OpenAI chat model name.
+        ollama_host: Optional override; otherwise uses OLLAMA_HOST or `https://ollama.com`.
+        ollama_api_key: Optional override; otherwise uses OLLAMA_API_KEY.
+        model: Ollama cloud model name. If omitted, uses OLLAMA_MODEL or `qwen3.5:cloud`.
         news_path: Path to `news_events.jsonl` for the news-timing feature.
         temperature: Sampling temperature for the model (default 0.1).
         include_db_event: Include PostgreSQL event row in model features.
@@ -363,7 +408,11 @@ def assess_insider_probability_for_event(
         fresh_market_data: Optional trigger-time snapshot (e.g. websocket cache).
             If omitted, a fresh API snapshot is fetched automatically.
     """
-    client = _get_openai_client(api_key=openai_api_key)
+    ollama_host, ollama_model, ollama_api_key = _get_ollama_config(
+        host=ollama_host,
+        model=model,
+        api_key=ollama_api_key,
+    )
     features = _build_feature_payload(
         event_id,
         base_url=base_url,
@@ -374,33 +423,45 @@ def assess_insider_probability_for_event(
     )
     prompt = _build_prompt(features)
 
-    completion = client.chat.completions.create(
-        model=model,
-        temperature=temperature,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a careful, risk-averse quantitative analyst whose "
-                    "job is to flag patterns that *might* indicate informed or "
-                    "insider trading in prediction markets."
-                ),
-            },
-            {
-                "role": "user",
-                "content": prompt,
-            },
-        ],
+    system_prompt = (
+        "You are a careful, risk-averse quantitative analyst whose "
+        "job is to flag patterns that *might* indicate informed or "
+        "insider trading in prediction markets."
     )
-
-    content = completion.choices[0].message.content or ""
-    try:
-        parsed = json.loads(content)
-    except json.JSONDecodeError:
-        # Best-effort fallback if the model did not strictly follow JSON.
-        raise RuntimeError(
-            f"OpenAI response was not valid JSON. Raw content was:\n{content}"
+    with httpx.Client(timeout=120.0) as client:
+        response = client.post(
+            _ollama_api_url(ollama_host, "chat"),
+            headers={
+                "Authorization": f"Bearer {ollama_api_key}",
+            },
+            json={
+                "model": ollama_model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": system_prompt,
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    },
+                ],
+                "stream": False,
+                "format": "json",
+                "options": {
+                    "temperature": temperature,
+                },
+            },
         )
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise RuntimeError(
+                f"Ollama cloud request failed with status {response.status_code}: {response.text}"
+            ) from exc
+        content = str((response.json().get("message") or {}).get("content") or "")
+
+    parsed = _extract_json_object(content)
 
     prob = float(parsed.get("probability_insider", 0.0))
     # Clamp to [0, 1] for safety.
@@ -419,4 +480,3 @@ __all__ = [
     "InsiderAssessment",
     "assess_insider_probability_for_event",
 ]
-

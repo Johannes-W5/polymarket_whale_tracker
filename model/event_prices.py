@@ -41,8 +41,24 @@ def _parse_clob_token_ids(market: dict[str, Any]) -> tuple[str | None, str | Non
         ids = json.loads(raw) if isinstance(raw, str) else raw
         if isinstance(ids, list) and len(ids) >= 2:
             return (str(ids[0]), str(ids[1]))
+        if isinstance(ids, dict):
+            # Polymarket payloads sometimes return a mapping instead of a list.
+            for yes_key, no_key in (
+                ("yes", "no"),
+                ("YES", "NO"),
+                ("0", "1"),
+                (0, 1),
+            ):
+                yes_token = ids.get(yes_key)
+                no_token = ids.get(no_key)
+                if yes_token and no_token:
+                    return (str(yes_token), str(no_token))
+
+            values = list(ids.values())
+            if len(values) >= 2:
+                return (str(values[0]), str(values[1]))
         return (None, None)
-    except (json.JSONDecodeError, TypeError):
+    except (json.JSONDecodeError, TypeError, ValueError):
         return (None, None)
 
 
