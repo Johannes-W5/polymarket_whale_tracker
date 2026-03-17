@@ -1,0 +1,2 @@
+-r ../model/requirements.txt
+streamlit

@@ -398,12 +398,23 @@ def _fetch_price_history(
     *,
     base_url: str | None = None,
     interval: str = "1m",
+    fidelity: Optional[int] = None,
     start_ts: Optional[int] = None,
     end_ts: Optional[int] = None,
     timeout: float = 30.0,
 ) -> list[dict[str, Any]]:
     base = _base_url(base_url)
     params: dict[str, Any] = {"market": market_id, "interval": interval}
+    min_fidelity_by_interval = {
+        "1m": 10,
+        "1w": 5,
+    }
+    resolved_fidelity = fidelity
+    required_fidelity = min_fidelity_by_interval.get(interval)
+    if required_fidelity is not None:
+        resolved_fidelity = max(required_fidelity, resolved_fidelity or required_fidelity)
+    if resolved_fidelity is not None:
+        params["fidelity"] = int(resolved_fidelity)
     if start_ts is not None:
         params["startTs"] = int(start_ts)
     if end_ts is not None:
@@ -450,77 +461,79 @@ def compute_price_history_stats_for_event(
 
     results: list[PriceHistoryStats] = []
     for m in markets:
-        mid = _select_condition_id(m)
-        if not mid:
-            continue
-        history = _fetch_price_history(
-            mid,
-            base_url=base_url,
-            interval=interval,
-            timeout=timeout,
-        )
-        if len(history) < 2:
-            results.append(
-                PriceHistoryStats(
-                    event_id=event_id,
-                    market_id=mid,
-                    last_price=None,
-                    last_return=None,
-                    z_score=None,
-                    window=0,
-                )
-            )
-            continue
-
-        # Sort by timestamp in case the API doesn't guarantee ordering.
-        history_sorted = sorted(history, key=lambda h: int(h.get("t", 0)))
-        if max_points and len(history_sorted) > max_points:
-            history_sorted = history_sorted[-max_points:]
-
-        prices: list[float] = []
-        for h in history_sorted:
-            try:
-                prices.append(float(h.get("p")))
-            except (TypeError, ValueError):
+        yes_token_id, no_token_id = _parse_clob_token_ids(m)
+        for token_id in (yes_token_id, no_token_id):
+            if not token_id:
                 continue
 
-        if len(prices) < 2:
+            history = _fetch_price_history(
+                token_id,
+                base_url=base_url,
+                interval=interval,
+                timeout=timeout,
+            )
+            if len(history) < 2:
+                results.append(
+                    PriceHistoryStats(
+                        event_id=event_id,
+                        market_id=token_id,
+                        last_price=None,
+                        last_return=None,
+                        z_score=None,
+                        window=0,
+                    )
+                )
+                continue
+
+            # Sort by timestamp in case the API doesn't guarantee ordering.
+            history_sorted = sorted(history, key=lambda h: int(h.get("t", 0)))
+            if max_points and len(history_sorted) > max_points:
+                history_sorted = history_sorted[-max_points:]
+
+            prices: list[float] = []
+            for h in history_sorted:
+                try:
+                    prices.append(float(h.get("p")))
+                except (TypeError, ValueError):
+                    continue
+
+            if len(prices) < 2:
+                results.append(
+                    PriceHistoryStats(
+                        event_id=event_id,
+                        market_id=token_id,
+                        last_price=prices[-1] if prices else None,
+                        last_return=None,
+                        z_score=None,
+                        window=0,
+                    )
+                )
+                continue
+
+            rets: list[float] = [
+                prices[i] - prices[i - 1] for i in range(1, len(prices))
+            ]
+            last_ret = rets[-1]
+            w = min(window, len(rets) - 1) if len(rets) > 1 else 0
+
+            if w > 1:
+                window_slice = rets[-w - 1 : -1]
+                mu = mean(window_slice)
+                sigma = pstdev(window_slice)
+                z = (last_ret - mu) / sigma if sigma > 0 else 0.0
+            else:
+                z = None
+
             results.append(
                 PriceHistoryStats(
                     event_id=event_id,
-                    market_id=mid,
-                    last_price=prices[-1] if prices else None,
-                    last_return=None,
-                    z_score=None,
-                    window=0,
+                    market_id=token_id,
+                    last_price=prices[-1],
+                    last_return=last_ret,
+                    z_score=z,
+                    window=w,
                 )
             )
-            continue
-
-        rets: list[float] = [
-            prices[i] - prices[i - 1] for i in range(1, len(prices))
-        ]
-        last_ret = rets[-1]
-        w = min(window, len(rets) - 1) if len(rets) > 1 else 0
-
-        if w > 1:
-            window_slice = rets[-w - 1 : -1]
-            mu = mean(window_slice)
-            sigma = pstdev(window_slice)
-            z = (last_ret - mu) / sigma if sigma > 0 else 0.0
-        else:
-            z = None
-
-        results.append(
-            PriceHistoryStats(
-                event_id=event_id,
-                market_id=mid,
-                last_price=prices[-1],
-                last_return=last_ret,
-                z_score=z,
-                window=w,
-            )
-        )
 
     return results
 

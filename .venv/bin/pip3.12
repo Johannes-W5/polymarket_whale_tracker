@@ -1,4 +1,4 @@
-#!/home/johannes/polymarket_sentiment/.venv/bin/python3
+#!/home/johannes/polymarket_whaletracker/.venv/bin/python3
 # -*- coding: utf-8 -*-
 import re
 import sys
