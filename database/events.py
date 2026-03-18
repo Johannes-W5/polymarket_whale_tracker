@@ -139,6 +139,78 @@ def insert_whale_spike(spike, market_id: str | None = None):
         conn.commit() 
 
 
+def _ensure_insider_assessments_table(cur) -> None:
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS insider_assessments (
+          id BIGSERIAL PRIMARY KEY,
+          event_id TEXT NOT NULL,
+          trigger_type TEXT NOT NULL,
+          market_id TEXT NULL,
+          side TEXT NULL,
+          from_ts TIMESTAMPTZ NULL,
+          to_ts TIMESTAMPTZ NULL,
+          from_price DOUBLE PRECISION NULL,
+          to_price DOUBLE PRECISION NULL,
+          abs_change DOUBLE PRECISION NULL,
+          rel_change DOUBLE PRECISION NULL,
+          probability_insider DOUBLE PRECISION NOT NULL,
+          confidence TEXT NOT NULL,
+          short_summary TEXT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """
+    )
+
+
+def insert_insider_assessment(
+    *,
+    event_id: str,
+    trigger_type: str,
+    spike,
+    assessment,
+    market_id: str | None = None,
+):
+    with closing(get_connection()) as conn, conn.cursor() as cur:
+        _ensure_insider_assessments_table(cur)
+        cur.execute(
+            """
+            INSERT INTO insider_assessments (
+              event_id,
+              trigger_type,
+              market_id,
+              side,
+              from_ts,
+              to_ts,
+              from_price,
+              to_price,
+              abs_change,
+              rel_change,
+              probability_insider,
+              confidence,
+              short_summary
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+            """,
+            (
+                str(event_id),
+                str(trigger_type),
+                market_id,
+                getattr(spike, "side", None),
+                getattr(spike, "from_ts", None),
+                getattr(spike, "to_ts", None),
+                getattr(spike, "from_price", None),
+                getattr(spike, "to_price", None),
+                getattr(spike, "abs_change", None),
+                getattr(spike, "rel_change", None),
+                float(getattr(assessment, "probability_insider")),
+                str(getattr(assessment, "confidence")),
+                str(getattr(assessment, "short_summary")),
+            ),
+        )
+        conn.commit()
+
+
 
 def update_market_volume(market_id: str, volume: float):
     with closing(get_connection()) as conn, conn.cursor() as cur:
@@ -176,3 +248,56 @@ def get_recent_whale_spikes(event_id: str, limit: int = 5):
             (event_id, max(1, min(int(limit), 100))),
         )
         return cur.fetchall()
+
+
+def get_latest_whale_spikes(limit: int = 20):
+    with closing(get_connection()) as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+              event_id,
+              market_id,
+              from_ts,
+              to_ts,
+              side,
+              from_price,
+              to_price,
+              abs_change,
+              rel_change
+            FROM whale_spikes
+            ORDER BY to_ts DESC
+            LIMIT %s;
+            """,
+            (max(1, min(int(limit), 100)),),
+        )
+        return cur.fetchall()
+
+
+def get_latest_assessment_for_event(event_id: str):
+    with closing(get_connection()) as conn, conn.cursor() as cur:
+        _ensure_insider_assessments_table(cur)
+        cur.execute(
+            """
+            SELECT
+              event_id,
+              trigger_type,
+              market_id,
+              side,
+              from_ts,
+              to_ts,
+              from_price,
+              to_price,
+              abs_change,
+              rel_change,
+              probability_insider,
+              confidence,
+              short_summary,
+              created_at
+            FROM insider_assessments
+            WHERE event_id = %s
+            ORDER BY created_at DESC, to_ts DESC NULLS LAST
+            LIMIT 1;
+            """,
+            (event_id,),
+        )
+        return cur.fetchone()

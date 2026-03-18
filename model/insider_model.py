@@ -379,6 +379,111 @@ def _extract_json_object(text: str) -> Dict[str, Any]:
             ) from exc
 
 
+def _extract_text_content(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
+    return ""
+
+
+def _extract_response_content(payload: Dict[str, Any]) -> str:
+    if all(key in payload for key in ("probability_insider", "confidence", "short_summary")):
+        return json.dumps(payload)
+
+    message = payload.get("message")
+    if isinstance(message, dict):
+        content = _extract_text_content(message.get("content"))
+        if content.strip():
+            return content
+
+    choices = payload.get("choices")
+    if isinstance(choices, list) and choices:
+        first_choice = choices[0]
+        if isinstance(first_choice, dict):
+            message = first_choice.get("message")
+            if isinstance(message, dict):
+                content = _extract_text_content(message.get("content"))
+                if content.strip():
+                    return content
+
+    content = _extract_text_content(payload.get("response"))
+    if content.strip():
+        return content
+
+    return ""
+
+
+def _request_ollama_assessment(
+    *,
+    client: httpx.Client,
+    api_url: str,
+    api_key: str,
+    model: str,
+    system_prompt: str,
+    prompt: str,
+    temperature: float,
+    strict_json_retry: bool = False,
+) -> Dict[str, Any]:
+    user_prompt = prompt
+    if strict_json_retry:
+        user_prompt = (
+            f"{prompt}\n\n"
+            "Your previous answer was invalid. Return exactly one valid JSON object and no extra text."
+        )
+
+    response = client.post(
+        api_url,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+        },
+        json={
+            "model": model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": system_prompt,
+                },
+                {
+                    "role": "user",
+                    "content": user_prompt,
+                },
+            ],
+            "stream": False,
+            "format": "json",
+            "options": {
+                "temperature": temperature,
+            },
+        },
+    )
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise RuntimeError(
+            f"Ollama cloud request failed with status {response.status_code}: {response.text}"
+        ) from exc
+
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            f"Ollama response had unexpected type {type(payload).__name__}: {payload}"
+        )
+
+    content = _extract_response_content(payload)
+    if not content.strip():
+        raise RuntimeError(f"Ollama response contained no content. Payload was:\n{payload}")
+
+    return _extract_json_object(content)
+
+
 def assess_insider_probability_for_event(
     event_id: str,
     *,
@@ -429,39 +534,42 @@ def assess_insider_probability_for_event(
         "insider trading in prediction markets."
     )
     with httpx.Client(timeout=120.0) as client:
-        response = client.post(
-            _ollama_api_url(ollama_host, "chat"),
-            headers={
-                "Authorization": f"Bearer {ollama_api_key}",
-            },
-            json={
-                "model": ollama_model,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": system_prompt,
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt,
-                    },
-                ],
-                "stream": False,
-                "format": "json",
-                "options": {
-                    "temperature": temperature,
-                },
-            },
-        )
         try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise RuntimeError(
-                f"Ollama cloud request failed with status {response.status_code}: {response.text}"
-            ) from exc
-        content = str((response.json().get("message") or {}).get("content") or "")
-
-    parsed = _extract_json_object(content)
+            parsed = _request_ollama_assessment(
+                client=client,
+                api_url=_ollama_api_url(ollama_host, "chat"),
+                api_key=ollama_api_key,
+                model=ollama_model,
+                system_prompt=system_prompt,
+                prompt=prompt,
+                temperature=temperature,
+            )
+        except RuntimeError as first_error:
+            print(
+                f"[insider-model] Retrying Ollama assessment for event {event_id} after malformed response: {first_error}",
+                flush=True,
+            )
+            try:
+                parsed = _request_ollama_assessment(
+                    client=client,
+                    api_url=_ollama_api_url(ollama_host, "chat"),
+                    api_key=ollama_api_key,
+                    model=ollama_model,
+                    system_prompt=system_prompt,
+                    prompt=prompt,
+                    temperature=temperature,
+                    strict_json_retry=True,
+                )
+            except RuntimeError as retry_error:
+                print(
+                    f"[insider-model] Ollama assessment fallback used for event {event_id}: {retry_error}",
+                    flush=True,
+                )
+                return InsiderAssessment(
+                    probability_insider=0.0,
+                    confidence="low",
+                    short_summary="Ollama returned an invalid or empty JSON response; assessment unavailable for this spike.",
+                )
 
     prob = float(parsed.get("probability_insider", 0.0))
     # Clamp to [0, 1] for safety.

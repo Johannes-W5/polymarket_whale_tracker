@@ -23,7 +23,7 @@ python -m model.insider_detection 2890 (or other event id)
 Try to fetch not only one event but all events in the database. Create database query to get all events.
 """
 
-from database.events import insert_whale_spike
+from database.events import insert_insider_assessment, insert_whale_spike
 
 import httpx
 import os
@@ -453,6 +453,16 @@ def monitor_event_and_assess_insider(
                     )
                 continue
             raise
+
+        try:
+            insert_insider_assessment(
+                event_id=event_id,
+                trigger_type=trigger_type,
+                spike=spike,
+                assessment=assessment,
+            )
+        except Exception as exc:
+            print(f"[whale-tracking] Failed to persist insider assessment for event {event_id}: {exc}", flush=True)
 
         yield TriggeredInsiderAssessment(
             event_id=event_id,
