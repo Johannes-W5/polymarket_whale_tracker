@@ -1,62 +1,63 @@
 from __future__ import annotations
 
 """
+Deterministic anomaly detection for public Polymarket market/news data.
 
-Whale-tracking and informed-flow detection utilities for Polymarket events.
-
-
-Core idea:
-
-
-- Poll yes/no prices for a given event over time.
-- Detect large, unexpected jumps ("spikes") that may indicate informed flow.
-
-This module does NOT make any trading decisions. It only:
-1) Normalises price samples for an event.
-2) Detects jumps between subsequent samples based on configurable thresholds.
-3) Provides a small CLI-style helper for quick experimentation.
-
-
-Start detector: cd /home/johannes/polymarket_sentiment
-source .venv/bin/activate   # oder: . .venv/bin/activate
-python -m model.insider_detection 2890 (or other event id)
-Try to fetch not only one event but all events in the database. Create database query to get all events.
+This module:
+1) Polls public yes/no prices for an event.
+2) Turns candidate moves into deterministic anomaly scores using market/news data.
+3) Uses the deterministic score to decide whether an LLM assessment is worth running.
 """
 
-from database.events import insert_insider_assessment, insert_whale_spike
-
-import httpx
+import hashlib
+import math
 import os
 import queue
 import threading
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from time import sleep
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
+
+import httpx
+
+from database.events import insert_insider_assessment, insert_whale_spike
 
 try:
     from openai import RateLimitError as OpenAIRateLimitError
 except ImportError:
     OpenAIRateLimitError = None  # type: ignore[misc, assignment]
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from time import sleep
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 
-DEFAULT_MIN_ABS_CHANGE = 0.03
-DEFAULT_MIN_REL_CHANGE = 0.08
-ALL_EVENTS_MIN_ABS_CHANGE = 0.05
-ALL_EVENTS_MIN_REL_CHANGE = 0.10
+DEFAULT_MIN_ABS_CHANGE = 0.01
+DEFAULT_MIN_REL_CHANGE = 0.02
+ALL_EVENTS_MIN_ABS_CHANGE = 0.015
+ALL_EVENTS_MIN_REL_CHANGE = 0.03
 DEFAULT_ASSESSMENT_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:cloud")
 DEFAULT_ASSESSMENT_TEMPERATURE = 0.1
+RECENT_ANOMALY_WINDOW_MINUTES = 60.0
 
-# Support both "python -m model.insider_detection" (package context)
-# and direct execution "python model/insider_detection.py".
+try:  # pragma: no cover - import fallback
+    from .anomaly_scoring import (  # type: ignore[relative-beyond-top-level]
+        AnomalyScoreInputs,
+        FEATURE_SNAPSHOT_CONTRACT_VERSION,
+        score_anomaly,
+    )
+except ImportError:  # pragma: no cover
+    from model.anomaly_scoring import (
+        AnomalyScoreInputs,
+        FEATURE_SNAPSHOT_CONTRACT_VERSION,
+        score_anomaly,
+    )
+
 try:  # pragma: no cover - import fallback
     from .event_prices import EventPrices, get_event_prices  # type: ignore[relative-beyond-top-level]
 except ImportError:  # pragma: no cover
     from model.event_prices import EventPrices, get_event_prices
 
 try:  # pragma: no cover - import fallback
-    from .market_signals import NewsTiming, find_nearest_news_for_event  # type: ignore[relative-beyond-top-level]
+    from .fresh_data import fetch_fresh_market_data_from_api  # type: ignore[relative-beyond-top-level]
 except ImportError:  # pragma: no cover
-    from model.market_signals import NewsTiming, find_nearest_news_for_event
+    from model.fresh_data import fetch_fresh_market_data_from_api
 
 try:  # pragma: no cover - import fallback
     from .insider_model import InsiderAssessment, assess_insider_probability_for_event  # type: ignore[relative-beyond-top-level]
@@ -64,9 +65,35 @@ except ImportError:  # pragma: no cover
     from model.insider_model import InsiderAssessment, assess_insider_probability_for_event
 
 try:  # pragma: no cover - import fallback
-    from .fresh_data import fetch_fresh_market_data_from_api  # type: ignore[relative-beyond-top-level]
+    from .market_signals import (  # type: ignore[relative-beyond-top-level]
+        NewsTiming,
+        OpenInterestSnapshot,
+        OrderbookImbalance,
+        PriceHistoryStats,
+        TradeBurstStats,
+        compute_open_interest_change,
+        compute_orderbook_imbalance_for_event,
+        compute_price_history_stats_for_event,
+        compute_trade_burst_stats,
+        fetch_open_interest_for_event,
+        fetch_primary_market_metadata,
+        find_nearest_news_for_event,
+    )
 except ImportError:  # pragma: no cover
-    from model.fresh_data import fetch_fresh_market_data_from_api
+    from model.market_signals import (
+        NewsTiming,
+        OpenInterestSnapshot,
+        OrderbookImbalance,
+        PriceHistoryStats,
+        TradeBurstStats,
+        compute_open_interest_change,
+        compute_orderbook_imbalance_for_event,
+        compute_price_history_stats_for_event,
+        compute_trade_burst_stats,
+        fetch_open_interest_for_event,
+        fetch_primary_market_metadata,
+        find_nearest_news_for_event,
+    )
 
 
 @dataclass
@@ -77,6 +104,12 @@ class PriceSample:
     captured_at: datetime
     yes_price: float | None
     no_price: float | None
+    market_id: str | None = None
+    market_title: str | None = None
+    market_liquidity: float | None = None
+    market_volume: float | None = None
+    yes_token_id: str | None = None
+    no_token_id: str | None = None
 
     @classmethod
     def from_event_prices(cls, event_id: str, prices: EventPrices) -> "PriceSample":
@@ -85,30 +118,49 @@ class PriceSample:
             captured_at=datetime.now(timezone.utc),
             yes_price=prices.yes_price,
             no_price=prices.no_price,
+            market_id=prices.market_id,
+            market_title=prices.market_title,
+            market_liquidity=prices.market_liquidity,
+            market_volume=prices.market_volume,
+            yes_token_id=prices.yes_token_id,
+            no_token_id=prices.no_token_id,
         )
 
 
 @dataclass
 class WhaleSpike:
-    """Detected price spike between two consecutive samples."""
+    """Deterministically scored anomaly between two consecutive samples."""
 
     event_id: str
     from_ts: datetime
     to_ts: datetime
-    side: str  # "YES" or "NO"
+    side: str
     from_price: float
     to_price: float
     abs_change: float
-    rel_change: float  # relative to from_price, e.g. 0.25 == +25%
+    rel_change: float
+    market_id: str | None = None
+    spike_id: str | None = None
+    deterministic_score: float | None = None
+    deterministic_score_band: str | None = None
+    deterministic_feature_snapshot: dict[str, Any] | None = None
+    scorer_version: str | None = None
+    trigger_type: str = "deterministic_anomaly"
+    signal_time: datetime | None = None
+    news_time: datetime | None = None
+    news_delta_minutes: float | None = None
+    llm_should_invoke: bool = False
+    llm_gate_reason: str | None = None
+    market_liquidity: float | None = None
+    market_volume: float | None = None
+
+    def to_payload(self, *, assessment: InsiderAssessment | None = None) -> dict[str, Any]:
+        return _spike_trigger_payload(self, assessment=assessment)
 
 
 @dataclass
 class InformedFlowSignal:
-    """
-    Spike that likely happened before relevant news was publicly visible.
-
-    This is a heuristic signal, not proof of insider trading.
-    """
+    """Anomaly that appears to lead nearby public news."""
 
     event_id: str
     spike: WhaleSpike
@@ -120,15 +172,28 @@ class InformedFlowSignal:
 
 @dataclass
 class TriggeredInsiderAssessment:
-    """
-    Result of running insider_model for a detection trigger.
-    """
+    """Persistable output row for a deterministic trigger and optional LLM review."""
 
     event_id: str
-    trigger_type: str  # "whale_spike" | "informed_flow"
+    trigger_type: str
     spike: WhaleSpike
     informed_flow: InformedFlowSignal | None
-    assessment: InsiderAssessment
+    assessment: InsiderAssessment | None
+
+    def to_payload(self) -> dict[str, Any]:
+        if self.informed_flow is not None:
+            return _informed_flow_trigger_payload(self.informed_flow, assessment=self.assessment)
+        payload = self.spike.to_payload(assessment=self.assessment)
+        payload["trigger_type"] = self.trigger_type
+        return payload
+
+
+def _isoformat(dt: datetime | None) -> str | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
 
 
 def _event_is_currently_active(
@@ -147,6 +212,19 @@ def _event_is_currently_active(
     return bool(event.get("active")) and not bool(event.get("closed", False))
 
 
+def _make_spike_id(spike: WhaleSpike) -> str:
+    raw = "|".join(
+        [
+            spike.event_id,
+            spike.market_id or "",
+            spike.side,
+            _isoformat(spike.from_ts) or "",
+            _isoformat(spike.to_ts) or "",
+        ]
+    )
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:20]
+
+
 def detect_spike_between(
     prev_sample: PriceSample,
     curr_sample: PriceSample,
@@ -155,34 +233,36 @@ def detect_spike_between(
     min_rel_change: float = DEFAULT_MIN_REL_CHANGE,
 ) -> list[WhaleSpike]:
     """
-    Detect price spikes between two samples for an event.
+    Detect candidate moves between two samples.
 
-    A spike is flagged when BOTH conditions hold for a side (yes/no):
-    - Absolute change >= min_abs_change
-    - Relative change >= min_rel_change (e.g. 0.3 == 30%)
+    `min_abs_change` and `min_rel_change` now act as low-signal floors only.
+    The main emission logic lives in deterministic anomaly scoring.
     """
     spikes: list[WhaleSpike] = []
 
     def _check_side(side: str, prev: Optional[float], curr: Optional[float]) -> None:
-        if prev is None or curr is None:
-            return
-        if prev <= 0:
+        if prev is None or curr is None or prev <= 0:
             return
         abs_change = curr - prev
         rel_change = abs(abs_change) / prev
-        if abs(abs_change) >= min_abs_change and rel_change >= min_rel_change:
-            spikes.append(
-                WhaleSpike(
-                    event_id=curr_sample.event_id,
-                    from_ts=prev_sample.captured_at,
-                    to_ts=curr_sample.captured_at,
-                    side=side,
-                    from_price=prev,
-                    to_price=curr,
-                    abs_change=abs_change,
-                    rel_change=rel_change,
-                )
-            )
+        if abs(abs_change) < min_abs_change and rel_change < min_rel_change:
+            return
+        spike = WhaleSpike(
+            event_id=curr_sample.event_id,
+            from_ts=prev_sample.captured_at,
+            to_ts=curr_sample.captured_at,
+            side=side,
+            from_price=prev,
+            to_price=curr,
+            abs_change=abs_change,
+            rel_change=rel_change,
+            market_id=curr_sample.market_id or prev_sample.market_id,
+            signal_time=curr_sample.captured_at,
+            market_liquidity=curr_sample.market_liquidity,
+            market_volume=curr_sample.market_volume,
+        )
+        spike.spike_id = _make_spike_id(spike)
+        spikes.append(spike)
 
     _check_side("YES", prev_sample.yes_price, curr_sample.yes_price)
     _check_side("NO", prev_sample.no_price, curr_sample.no_price)
@@ -197,12 +277,6 @@ def iter_price_samples(
     side: str = "BUY",
     request_timeout: float = 30.0,
 ) -> Iterator[PriceSample]:
-    """
-    Infinite iterator of price samples for an event, polling the server API.
-
-    Intended for real-time monitoring; wrap and break out in your own code
-    when you want to stop the loop.
-    """
     while True:
         try:
             prices = get_event_prices(
@@ -217,6 +291,240 @@ def iter_price_samples(
         sleep(interval_seconds)
 
 
+def _select_side_token(sample: PriceSample, side: str) -> str | None:
+    return sample.yes_token_id if side == "YES" else sample.no_token_id
+
+
+def _select_price_stats(price_stats: list[PriceHistoryStats], token_id: str | None) -> PriceHistoryStats | None:
+    if token_id is None:
+        return None
+    for stat in price_stats:
+        if stat.market_id == token_id:
+            return stat
+    return None
+
+
+def _select_orderbook(orderbooks: list[OrderbookImbalance], side: str) -> OrderbookImbalance | None:
+    for orderbook in orderbooks:
+        if orderbook.side == side:
+            return orderbook
+    return None
+
+
+def _prune_recent_anomalies(
+    anomalies: list[WhaleSpike],
+    *,
+    now: datetime,
+    window_minutes: float = RECENT_ANOMALY_WINDOW_MINUTES,
+) -> list[WhaleSpike]:
+    cutoff = now - timedelta(minutes=window_minutes)
+    return [spike for spike in anomalies if spike.to_ts >= cutoff]
+
+
+def _safe_fetch_news(
+    event_id: str,
+    *,
+    signal_time: datetime,
+    base_url: str,
+    news_path: str,
+    window_minutes: float,
+) -> NewsTiming | None:
+    try:
+        return find_nearest_news_for_event(
+            event_id,
+            signal_time=signal_time,
+            base_url=base_url,
+            news_path=news_path,
+            window_minutes=window_minutes,
+        )
+    except Exception as exc:
+        print(f"[whale-tracking] Failed to fetch news timing for event {event_id}: {exc}", flush=True)
+        return None
+
+
+def _score_spike_candidate(
+    spike: WhaleSpike,
+    *,
+    event_id: str,
+    signal_sample: PriceSample,
+    base_url: str,
+    news_path: str,
+    news_window_minutes: float,
+    request_timeout: float,
+    prev_open_interest_by_market: dict[str, OpenInterestSnapshot],
+    recent_anomalies: list[WhaleSpike],
+) -> WhaleSpike | None:
+    market_meta = None
+    try:
+        market_meta = fetch_primary_market_metadata(event_id, base_url=base_url, timeout=request_timeout)
+    except Exception as exc:
+        print(f"[whale-tracking] Failed to fetch market metadata for event {event_id}: {exc}", flush=True)
+
+    if market_meta is not None:
+        spike.market_id = spike.market_id or market_meta.market_id
+        spike.market_liquidity = spike.market_liquidity or market_meta.liquidity
+        spike.market_volume = spike.market_volume or market_meta.volume
+        spike.spike_id = _make_spike_id(spike)
+
+    orderbooks: list[OrderbookImbalance] = []
+    try:
+        orderbooks = compute_orderbook_imbalance_for_event(event_id, base_url=base_url, timeout=request_timeout)
+    except Exception as exc:
+        print(f"[whale-tracking] Failed to fetch order book features for event {event_id}: {exc}", flush=True)
+
+    trade_stats: TradeBurstStats | None = None
+    try:
+        trade_stats = compute_trade_burst_stats(
+            event_id,
+            base_url=base_url,
+            as_of=spike.to_ts,
+            timeout=request_timeout,
+        )
+    except Exception as exc:
+        print(f"[whale-tracking] Failed to fetch trade burst features for event {event_id}: {exc}", flush=True)
+
+    price_stats: list[PriceHistoryStats] = []
+    try:
+        price_stats = compute_price_history_stats_for_event(
+            event_id,
+            base_url=base_url,
+            timeout=request_timeout,
+        )
+    except Exception as exc:
+        print(f"[whale-tracking] Failed to fetch price history stats for event {event_id}: {exc}", flush=True)
+
+    current_oi_by_market: dict[str, OpenInterestSnapshot] = {}
+    try:
+        for snapshot in fetch_open_interest_for_event(
+            event_id,
+            base_url=base_url,
+            timeout=request_timeout,
+        ):
+            current_oi_by_market[snapshot.market_id] = snapshot
+    except Exception as exc:
+        print(f"[whale-tracking] Failed to fetch open interest for event {event_id}: {exc}", flush=True)
+
+    oi_rel_change = None
+    if spike.market_id and spike.market_id in current_oi_by_market:
+        prev_oi = prev_open_interest_by_market.get(spike.market_id)
+        if prev_oi is not None:
+            oi_rel_change = compute_open_interest_change(
+                prev_oi,
+                current_oi_by_market[spike.market_id],
+            ).rel_change
+    prev_open_interest_by_market.update(current_oi_by_market)
+
+    news_timing = _safe_fetch_news(
+        event_id,
+        signal_time=spike.to_ts,
+        base_url=base_url,
+        news_path=news_path,
+        window_minutes=news_window_minutes,
+    )
+    if news_timing is not None:
+        spike.news_time = news_timing.news_time
+        spike.news_delta_minutes = news_timing.delta_minutes
+
+    direction = 1.0 if spike.abs_change >= 0 else -1.0
+    side_token_id = _select_side_token(signal_sample, spike.side)
+    price_stat = _select_price_stats(price_stats, side_token_id)
+    orderbook = _select_orderbook(orderbooks, spike.side)
+
+    realized_volatility = price_stat.realized_volatility if price_stat is not None else None
+    volatility_adjusted_jump = abs(spike.abs_change) / max(realized_volatility or 0.01, 0.01)
+
+    liquidity_reference = spike.market_liquidity if spike.market_liquidity is not None else 25_000.0
+    liquidity_adjusted_move = abs(spike.abs_change) / max(
+        math.sqrt(max(liquidity_reference, 1.0) / 25_000.0),
+        0.25,
+    )
+    spread_adjusted_move = abs(spike.abs_change) / max((orderbook.spread if orderbook else None) or 0.01, 0.01)
+    directional_orderbook_imbalance = max(0.0, direction * ((orderbook.imbalance if orderbook else 0.0)))
+    directional_aggressor_imbalance = max(
+        0.0,
+        direction * ((trade_stats.aggressor_imbalance if trade_stats else 0.0)),
+    )
+
+    recent_anomalies = _prune_recent_anomalies(recent_anomalies, now=spike.to_ts)
+    recent_scores = [item.deterministic_score or 0.0 for item in recent_anomalies]
+    scored = score_anomaly(
+        AnomalyScoreInputs(
+            price_move_abs=abs(spike.abs_change),
+            price_move_rel=spike.rel_change,
+            volatility_adjusted_jump=volatility_adjusted_jump,
+            liquidity_adjusted_move=liquidity_adjusted_move,
+            spread_adjusted_move=spread_adjusted_move,
+            directional_orderbook_imbalance=directional_orderbook_imbalance,
+            spread_bps=orderbook.spread_bps if orderbook else None,
+            depth_near_touch=orderbook.depth_near_touch if orderbook else None,
+            trade_count_burst=trade_stats.trade_count_burst if trade_stats else None,
+            volume_burst=trade_stats.volume_burst if trade_stats else None,
+            directional_aggressor_imbalance=directional_aggressor_imbalance,
+            open_interest_rel_change=oi_rel_change,
+            news_delta_minutes=spike.news_delta_minutes,
+            recent_anomaly_count=len(recent_anomalies),
+            recent_max_score=max(recent_scores) if recent_scores else None,
+        )
+    )
+
+    snapshot = dict(scored.deterministic_feature_snapshot)
+    snapshot["snapshot_storage_contract"] = {
+        "version": FEATURE_SNAPSHOT_CONTRACT_VERSION,
+        "public_data_only": True,
+        "llm_role": "explanation_confidence_refinement",
+    }
+    snapshot["point_in_time"] = {
+        "from_ts": _isoformat(spike.from_ts),
+        "to_ts": _isoformat(spike.to_ts),
+        "signal_time": _isoformat(spike.signal_time or spike.to_ts),
+    }
+    snapshot["market_context"] = {
+        "market_id": spike.market_id,
+        "market_title": signal_sample.market_title,
+        "market_liquidity": spike.market_liquidity,
+        "market_volume": spike.market_volume,
+        "side_token_id": side_token_id,
+    }
+    snapshot["price_context"] = {
+        "yes_price": signal_sample.yes_price,
+        "no_price": signal_sample.no_price,
+        "volatility_reference": realized_volatility,
+        "price_history_z_score": price_stat.z_score if price_stat is not None else None,
+    }
+    snapshot["orderbook_context"] = {
+        "imbalance": orderbook.imbalance if orderbook else None,
+        "spread": orderbook.spread if orderbook else None,
+        "spread_bps": orderbook.spread_bps if orderbook else None,
+        "depth_near_touch": orderbook.depth_near_touch if orderbook else None,
+    }
+    snapshot["trade_context"] = {
+        "trade_count_burst": trade_stats.trade_count_burst if trade_stats else None,
+        "volume_burst": trade_stats.volume_burst if trade_stats else None,
+        "aggressor_imbalance": trade_stats.aggressor_imbalance if trade_stats else None,
+        "recent_trade_count": trade_stats.recent_trade_count if trade_stats else None,
+    }
+    snapshot["open_interest_context"] = {
+        "open_interest_rel_change": oi_rel_change,
+    }
+    snapshot["news_context"] = {
+        "news_time": _isoformat(news_timing.news_time) if news_timing else None,
+        "news_delta_minutes": spike.news_delta_minutes,
+        "news_source": news_timing.source if news_timing else None,
+        "news_title": news_timing.title if news_timing else None,
+    }
+
+    spike.deterministic_score = scored.deterministic_score
+    spike.deterministic_score_band = scored.deterministic_score_band
+    spike.deterministic_feature_snapshot = snapshot
+    spike.scorer_version = scored.scorer_version
+    spike.trigger_type = scored.trigger_type
+    spike.signal_time = spike.to_ts
+    spike.llm_should_invoke = scored.should_call_llm
+    spike.llm_gate_reason = scored.llm_gate_reason
+
+    return spike if scored.should_emit else None
+
+
 def monitor_event_for_spikes(
     event_id: str,
     *,
@@ -224,23 +532,15 @@ def monitor_event_for_spikes(
     interval_seconds: float = 5.0,
     min_abs_change: float = DEFAULT_MIN_ABS_CHANGE,
     min_rel_change: float = DEFAULT_MIN_REL_CHANGE,
+    news_path: str = "news_scraper/data/news_events.jsonl",
+    news_window_minutes: float = 240.0,
     sample_iter_factory: Callable[..., Iterable[PriceSample]] | None = None,
     request_timeout: float = 30.0,
 ) -> Iterator[WhaleSpike]:
-    """
-    High-level helper: continuously monitor an event and yield detected spikes.
-
-    - Uses `iter_price_samples` by default to poll the server.
-    - Exposed as a generator so you can:
-        * Log spikes
-        * Push them to a message queue
-        * Trigger downstream trading logic
-
-    The `sample_iter_factory` hook makes this function testable by injecting
-    a finite sequence of samples.
-    """
     factory = sample_iter_factory or iter_price_samples
     prev_sample: PriceSample | None = None
+    prev_open_interest_by_market: dict[str, OpenInterestSnapshot] = {}
+    recent_anomalies: list[WhaleSpike] = []
 
     for sample in factory(
         event_id,
@@ -249,14 +549,29 @@ def monitor_event_for_spikes(
         request_timeout=request_timeout,
     ):
         if prev_sample is not None:
-            spikes = detect_spike_between(
+            candidates = detect_spike_between(
                 prev_sample,
                 sample,
                 min_abs_change=min_abs_change,
                 min_rel_change=min_rel_change,
             )
-            for spike in spikes:
-                yield spike
+            recent_anomalies = _prune_recent_anomalies(recent_anomalies, now=sample.captured_at)
+            for candidate in candidates:
+                scored = _score_spike_candidate(
+                    candidate,
+                    event_id=event_id,
+                    signal_sample=sample,
+                    base_url=base_url,
+                    news_path=news_path,
+                    news_window_minutes=news_window_minutes,
+                    request_timeout=request_timeout,
+                    prev_open_interest_by_market=prev_open_interest_by_market,
+                    recent_anomalies=recent_anomalies,
+                )
+                if scored is None:
+                    continue
+                recent_anomalies.append(scored)
+                yield scored
         prev_sample = sample
 
 
@@ -264,31 +579,32 @@ def assess_informed_flow_for_spike(
     spike: WhaleSpike,
     *,
     base_url: str,
-    news_path: str = "data/news_events.jsonl",
+    news_path: str = "news_scraper/data/news_events.jsonl",
     min_news_lead_minutes: float = 5.0,
     news_window_minutes: float = 240.0,
 ) -> InformedFlowSignal | None:
-    """
-    Classify a spike as "possible informed flow" if it clearly leads nearby news.
-
-    Logic:
-    - Find nearest related news around the spike timestamp.
-    - Require that news timestamp is AFTER the spike by at least
-      `min_news_lead_minutes`.
-    """
-    nearest: NewsTiming | None = find_nearest_news_for_event(
-        spike.event_id,
-        signal_time=spike.to_ts,
-        base_url=base_url,
-        news_path=news_path,
-        window_minutes=news_window_minutes,
-    )
-    if nearest is None:
-        return None
-
-    # Positive delta means the news was ingested after the spike.
-    if nearest.delta_minutes < min_news_lead_minutes:
-        return None
+    nearest: NewsTiming | None = None
+    if spike.news_time is not None and spike.news_delta_minutes is not None:
+        if spike.news_delta_minutes < min_news_lead_minutes:
+            return None
+        nearest = NewsTiming(
+            event_id=spike.event_id,
+            signal_time=spike.signal_time or spike.to_ts,
+            news_time=spike.news_time,
+            delta_minutes=spike.news_delta_minutes,
+            source=str((spike.deterministic_feature_snapshot or {}).get("news_context", {}).get("news_source") or ""),
+            title=str((spike.deterministic_feature_snapshot or {}).get("news_context", {}).get("news_title") or ""),
+        )
+    else:
+        nearest = _safe_fetch_news(
+            spike.event_id,
+            signal_time=spike.to_ts,
+            base_url=base_url,
+            news_path=news_path,
+            window_minutes=news_window_minutes,
+        )
+        if nearest is None or nearest.delta_minutes < min_news_lead_minutes:
+            return None
 
     return InformedFlowSignal(
         event_id=spike.event_id,
@@ -307,21 +623,22 @@ def monitor_event_for_informed_flow(
     interval_seconds: float = 5.0,
     min_abs_change: float = DEFAULT_MIN_ABS_CHANGE,
     min_rel_change: float = DEFAULT_MIN_REL_CHANGE,
-    news_path: str = "data/news_events.jsonl",
+    news_path: str = "news_scraper/data/news_events.jsonl",
     min_news_lead_minutes: float = 5.0,
     news_window_minutes: float = 240.0,
     sample_iter_factory: Callable[..., Iterable[PriceSample]] | None = None,
+    request_timeout: float = 30.0,
 ) -> Iterator[InformedFlowSignal]:
-    """
-    Continuously monitor and emit spikes that appear to lead relevant news.
-    """
     for spike in monitor_event_for_spikes(
         event_id,
         base_url=base_url,
         interval_seconds=interval_seconds,
         min_abs_change=min_abs_change,
         min_rel_change=min_rel_change,
+        news_path=news_path,
+        news_window_minutes=news_window_minutes,
         sample_iter_factory=sample_iter_factory,
+        request_timeout=request_timeout,
     ):
         signal = assess_informed_flow_for_spike(
             spike,
@@ -334,29 +651,61 @@ def monitor_event_for_informed_flow(
             yield signal
 
 
-def _isoformat(dt: datetime) -> str:
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).isoformat()
-
-
-def _spike_trigger_payload(spike: WhaleSpike) -> Dict[str, Any]:
+def _spike_trigger_payload(
+    spike: WhaleSpike,
+    *,
+    assessment: InsiderAssessment | None = None,
+) -> Dict[str, Any]:
     return {
+        "spike_id": spike.spike_id,
         "event_id": spike.event_id,
+        "market_id": spike.market_id,
+        "side": spike.side,
         "from_ts": _isoformat(spike.from_ts),
         "to_ts": _isoformat(spike.to_ts),
-        "side": spike.side,
-        "from_price": spike.from_price,
-        "to_price": spike.to_price,
+        "deterministic_score": spike.deterministic_score,
+        "deterministic_score_band": spike.deterministic_score_band,
+        "deterministic_feature_snapshot": spike.deterministic_feature_snapshot,
+        "scorer_version": spike.scorer_version,
+        "trigger_type": spike.trigger_type,
+        "signal_time": _isoformat(spike.signal_time or spike.to_ts),
+        "news_time": _isoformat(spike.news_time),
+        "news_delta_minutes": spike.news_delta_minutes,
+        "llm_probability": (
+            assessment.probability_insider if assessment is not None else None
+        ),
+        "llm_confidence": assessment.confidence if assessment is not None else None,
+        "llm_summary": assessment.short_summary if assessment is not None else None,
+        "llm_version": assessment.llm_version if assessment is not None else None,
+        "prompt_hash": assessment.prompt_hash if assessment is not None else None,
+        "prompt_version": assessment.prompt_version if assessment is not None else None,
+        "deterministic_prior_probability": (
+            assessment.deterministic_prior_probability if assessment is not None else None
+        ),
+        "llm_probability_adjustment": (
+            assessment.probability_adjustment if assessment is not None else None
+        ),
+        "llm_fallback_reason": (
+            assessment.fallback_reason if assessment is not None else None
+        ),
         "abs_change": spike.abs_change,
         "rel_change": spike.rel_change,
+        "from_price": spike.from_price,
+        "to_price": spike.to_price,
+        "llm_should_invoke": spike.llm_should_invoke,
+        "llm_gate_reason": spike.llm_gate_reason,
     }
 
 
-def _informed_flow_trigger_payload(signal: InformedFlowSignal) -> Dict[str, Any]:
-    payload = _spike_trigger_payload(signal.spike)
+def _informed_flow_trigger_payload(
+    signal: InformedFlowSignal,
+    *,
+    assessment: InsiderAssessment | None = None,
+) -> Dict[str, Any]:
+    payload = _spike_trigger_payload(signal.spike, assessment=assessment)
     payload.update(
         {
+            "trigger_type": "informed_flow",
             "lead_minutes": signal.lead_minutes,
             "news_title": signal.news_title,
             "news_source": signal.news_source,
@@ -373,7 +722,7 @@ def monitor_event_and_assess_insider(
     interval_seconds: float = 5.0,
     min_abs_change: float = DEFAULT_MIN_ABS_CHANGE,
     min_rel_change: float = DEFAULT_MIN_REL_CHANGE,
-    news_path: str = "data/news_events.jsonl",
+    news_path: str = "news_scraper/data/news_events.jsonl",
     min_news_lead_minutes: float = 5.0,
     news_window_minutes: float = 240.0,
     openai_model: str = DEFAULT_ASSESSMENT_MODEL,
@@ -383,9 +732,6 @@ def monitor_event_and_assess_insider(
     skip_active_check: bool = False,
     request_timeout: float = 30.0,
 ) -> Iterator[TriggeredInsiderAssessment]:
-    """
-    Run insider_model only when a spike or informed-flow signal is detected.
-    """
     if not skip_active_check and not _event_is_currently_active(event_id, base_url=base_url):
         print(f"[whale-tracking] Skipping inactive event {event_id}.", flush=True)
         return
@@ -396,11 +742,12 @@ def monitor_event_and_assess_insider(
         interval_seconds=interval_seconds,
         min_abs_change=min_abs_change,
         min_rel_change=min_rel_change,
+        news_path=news_path,
+        news_window_minutes=news_window_minutes,
         sample_iter_factory=sample_iter_factory,
         request_timeout=request_timeout,
     ):
-        # Persist each detected spike for downstream querying/auditing.
-        insert_whale_spike(spike)
+        insert_whale_spike(spike, market_id=spike.market_id)
 
         informed_signal = assess_informed_flow_for_spike(
             spike,
@@ -409,50 +756,60 @@ def monitor_event_and_assess_insider(
             min_news_lead_minutes=min_news_lead_minutes,
             news_window_minutes=news_window_minutes,
         )
-        if informed_signal is not None:
-            trigger_type = "informed_flow"
-            trigger_payload = _informed_flow_trigger_payload(informed_signal)
-        else:
-            trigger_type = "whale_spike"
-            trigger_payload = _spike_trigger_payload(spike)
 
-        if fresh_data_provider is not None:
-            fresh_market_data = fresh_data_provider(event_id)
-        else:
-            fresh_market_data = fetch_fresh_market_data_from_api(
-                event_id,
-                base_url=base_url,
-            )
+        trigger_type = "informed_flow" if informed_signal is not None else spike.trigger_type
+        assessment: InsiderAssessment | None = None
+        trigger_payload = (
+            _informed_flow_trigger_payload(informed_signal)
+            if informed_signal is not None
+            else _spike_trigger_payload(spike)
+        )
 
-        try:
-            assessment = assess_insider_probability_for_event(
-                event_id=event_id,
-                base_url=base_url,
-                model=openai_model,
-                news_path=news_path,
-                temperature=openai_temperature,
-                include_db_event=True,
-                trigger_context={
-                    "trigger_type": trigger_type,
-                    "trigger_payload": trigger_payload,
-                },
-                fresh_market_data=fresh_market_data,
-            )
-        except Exception as api_err:
-            if OpenAIRateLimitError is not None and isinstance(api_err, OpenAIRateLimitError):
-                err_body = getattr(api_err, "body", None) or {}
-                if isinstance(err_body, dict) and err_body.get("error", {}).get("type") == "insufficient_quota":
-                    print(
-                        "[whale-tracking] OpenAI quota exceeded (429). Add credits at https://platform.openai.com/account/billing. Skipping assessment for this spike.",
-                        flush=True,
-                    )
+        if spike.llm_should_invoke:
+            if fresh_data_provider is not None:
+                fresh_market_data = fresh_data_provider(event_id)
+            else:
+                fresh_market_data = fetch_fresh_market_data_from_api(
+                    event_id,
+                    base_url=base_url,
+                )
+            try:
+                assessment = assess_insider_probability_for_event(
+                    event_id=event_id,
+                    base_url=base_url,
+                    model=openai_model,
+                    news_path=news_path,
+                    temperature=openai_temperature,
+                    include_db_event=True,
+                    trigger_context={
+                        "trigger_type": trigger_type,
+                        "signal_time": _isoformat(spike.signal_time or spike.to_ts),
+                        "trigger_payload": trigger_payload,
+                    },
+                    fresh_market_data=fresh_market_data,
+                )
+            except Exception as api_err:
+                if OpenAIRateLimitError is not None and isinstance(api_err, OpenAIRateLimitError):
+                    err_body = getattr(api_err, "body", None) or {}
+                    if isinstance(err_body, dict) and err_body.get("error", {}).get("type") == "insufficient_quota":
+                        print(
+                            "[whale-tracking] OpenAI quota exceeded (429). Skipping assessment for this anomaly.",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            "[whale-tracking] OpenAI rate limit (429). Skipping assessment for this anomaly.",
+                            flush=True,
+                        )
+                    assessment = None
                 else:
-                    print(
-                        "[whale-tracking] OpenAI rate limit (429). Skipping assessment for this spike; will retry on next.",
-                        flush=True,
-                    )
-                continue
-            raise
+                    raise
+
+        trigger_payload = (
+            _informed_flow_trigger_payload(informed_signal, assessment=assessment)
+            if informed_signal is not None
+            else _spike_trigger_payload(spike, assessment=assessment)
+        )
 
         try:
             insert_insider_assessment(
@@ -460,9 +817,11 @@ def monitor_event_and_assess_insider(
                 trigger_type=trigger_type,
                 spike=spike,
                 assessment=assessment,
+                market_id=spike.market_id,
+                trigger_payload=trigger_payload,
             )
         except Exception as exc:
-            print(f"[whale-tracking] Failed to persist insider assessment for event {event_id}: {exc}", flush=True)
+            print(f"[whale-tracking] Failed to persist trigger for event {event_id}: {exc}", flush=True)
 
         yield TriggeredInsiderAssessment(
             event_id=event_id,
@@ -480,7 +839,7 @@ def monitor_events_and_assess_insider(
     interval_seconds: float = 5.0,
     min_abs_change: float = DEFAULT_MIN_ABS_CHANGE,
     min_rel_change: float = DEFAULT_MIN_REL_CHANGE,
-    news_path: str = "data/news_events.jsonl",
+    news_path: str = "news_scraper/data/news_events.jsonl",
     min_news_lead_minutes: float = 5.0,
     news_window_minutes: float = 240.0,
     openai_model: str = DEFAULT_ASSESSMENT_MODEL,
@@ -490,18 +849,6 @@ def monitor_events_and_assess_insider(
     skip_active_check: bool = False,
     request_timeout: float = 30.0,
 ) -> Iterator[TriggeredInsiderAssessment]:
-    """
-    Concurrently monitor multiple events and yield insider assessments.
-
-    Spawns one daemon thread per event_id, each running
-    `monitor_event_and_assess_insider`. Results from all threads are
-    collected in a shared queue and yielded in arrival order.
-
-    The iterator runs until all threads exit (which only happens if the
-    underlying generators are finite, e.g. in tests). In production the
-    threads are infinite loops, so this iterator also runs indefinitely
-    until the process is killed.
-    """
     if not event_ids:
         return
 
@@ -530,20 +877,16 @@ def monitor_events_and_assess_insider(
             exc_type = type(exc).__name__
             print(f"[whale-tracking] Worker for event {eid} exited with error: {exc_type}: {exc}", flush=True)
 
-    threads = [
-        threading.Thread(target=_worker, args=(eid,), daemon=True)
-        for eid in event_ids
-    ]
-    for t in threads:
-        t.start()
+    threads = [threading.Thread(target=_worker, args=(eid,), daemon=True) for eid in event_ids]
+    for thread in threads:
+        thread.start()
 
-    while any(t.is_alive() for t in threads):
+    while any(thread.is_alive() for thread in threads):
         try:
             yield result_queue.get(timeout=1.0)
         except queue.Empty:
             continue
 
-    # Drain any results that arrived after the last is_alive() check.
     while not result_queue.empty():
         yield result_queue.get_nowait()
 
@@ -561,10 +904,13 @@ if __name__ == "__main__":
         sys.stdout.reconfigure(line_buffering=True)
 
     from database.events import get_all_event_ids
-    from .event_prices import DEFAULT_BASE_URL
+    try:  # pragma: no cover - import fallback
+        from .event_prices import DEFAULT_BASE_URL  # type: ignore[relative-beyond-top-level]
+    except ImportError:  # pragma: no cover
+        from model.event_prices import DEFAULT_BASE_URL
 
     parser = argparse.ArgumentParser(
-        description="Monitor one or more Polymarket events for large price jumps (whale spikes)."
+        description="Monitor one or more Polymarket events for deterministic public-data anomalies."
     )
     parser.add_argument(
         "event_ids",
@@ -593,7 +939,7 @@ if __name__ == "__main__":
         type=float,
         default=None,
         help=(
-            "Minimum absolute price change to flag a spike "
+            "Absolute move floor used to ignore tiny price noise "
             f"(default: {DEFAULT_MIN_ABS_CHANGE:.2f}; "
             f"{ALL_EVENTS_MIN_ABS_CHANGE:.2f} with --all-events)."
         ),
@@ -603,14 +949,14 @@ if __name__ == "__main__":
         type=float,
         default=None,
         help=(
-            "Minimum relative price change as a fraction "
+            "Relative move floor used to ignore tiny price noise "
             f"(default: {DEFAULT_MIN_REL_CHANGE:.2f}; "
             f"{ALL_EVENTS_MIN_REL_CHANGE:.2f} with --all-events)."
         ),
     )
     parser.add_argument(
         "--news-path",
-        default="data/news_events.jsonl",
+        default="news_scraper/data/news_events.jsonl",
         help="Path to JSONL news dataset used for pre-news informed-flow checks.",
     )
     parser.add_argument(
@@ -690,7 +1036,7 @@ if __name__ == "__main__":
         raise SystemExit(1)
 
     print(
-        f"Monitoring {len(event_ids)} event(s). Ollama assessments will appear below when spikes are detected.",
+        f"Monitoring {len(event_ids)} event(s). Deterministic anomaly scores and gated explanation-layer outputs will appear below.",
         flush=True,
     )
 
@@ -708,15 +1054,32 @@ if __name__ == "__main__":
         skip_active_check=args.all_events,
         request_timeout=args.request_timeout,
     ):
-        # Testing: only show model assessment (probability, confidence, summary).
         a = result.assessment
+        score_value = (
+            f"{result.spike.deterministic_score:.2f}"
+            if result.spike.deterministic_score is not None
+            else "n/a"
+        )
         print(
-            f"[Ollama] event_id={result.event_id} "
-            f"probability_insider={a.probability_insider:.3f} "
-            f"confidence={a.confidence} "
-            f"summary={a.short_summary}",
+            f"[deterministic] event_id={result.event_id} "
+            f"trigger={result.trigger_type} "
+            f"score={score_value} "
+            f"band={result.spike.deterministic_score_band or 'n/a'}",
             flush=True,
         )
+        if a is not None:
+            print(
+                f"[llm] event_id={result.event_id} "
+                f"research_signal_probability={a.probability_insider:.3f} "
+                f"confidence={a.confidence} "
+                f"summary={a.short_summary}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[llm-skipped] event_id={result.event_id} gate_reason={result.spike.llm_gate_reason or 'n/a'}",
+                flush=True,
+            )
         # print(
         #     "[whale-spike]",
         #     spike.event_id,

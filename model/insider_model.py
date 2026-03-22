@@ -1,25 +1,23 @@
 from __future__ import annotations
 
 """
-Ollama-based heuristic for detecting likely insider / informed trading.
+LLM explanation layer for deterministic public-data anomalies.
 
-This module takes:
-- Polymarket event metadata (via the local proxy `/events/{id}`)
-- Derived market activity signals from `model.market_signals`
+The deterministic scorer remains the primary source of evidence. This module
+uses an LLM only to:
+- explain the frozen deterministic snapshot,
+- refine confidence,
+- apply a tightly bounded adjustment around a deterministic prior.
 
-and asks an Ollama model to produce:
-- A probability in [0, 1] that current activity is driven by materially
-  informed / insider trading rather than ordinary speculative flow.
-- A short natural-language summary explaining the reasoning.
-
-The result is NOT a legal determination and should only be used as a
-research / analytics signal.
+Outputs are research signals only and are not legal or compliance judgments.
 """
 
+import hashlib
 import json
 import os
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -29,29 +27,45 @@ from database.events import (
     get_recent_whale_spikes,
     insert_event as insert_event_to_db,
 )
+from .anomaly_scoring import FEATURE_SNAPSHOT_CONTRACT_VERSION
 from .event_prices import DEFAULT_BASE_URL
 from .fresh_data import fetch_fresh_market_data_from_api
 from .market_signals import (
-    VolumeStats,
-    OrderbookImbalance,
-    OpenInterestSnapshot,
-    PriceHistoryStats,
     NewsTiming,
-    compute_volume_stats,
+    OpenInterestSnapshot,
+    OrderbookImbalance,
+    PriceHistoryStats,
+    VolumeStats,
     compute_orderbook_imbalance_for_event,
-    fetch_open_interest_for_event,
     compute_price_history_stats_for_event,
+    compute_volume_stats,
+    fetch_open_interest_for_event,
     find_nearest_news_for_event,
+)
+
+PROMPT_VERSION = "llm-explanation-v2"
+EXPLANATION_PAYLOAD_VERSION = "llm-explanation-payload-v2"
+LEGACY_LIVE_PAYLOAD_VERSION = "legacy-live-explanation-payload-v1"
+MAX_PROBABILITY_ADJUSTMENT = 0.12
+DEFAULT_SUMMARY_FALLBACK = (
+    "The explanation layer was unavailable, so this record falls back to the "
+    "deterministic public-data anomaly score only."
 )
 
 
 @dataclass
 class InsiderAssessment:
-    """Structured result from the Ollama insider-risk classifier."""
+    """Structured explanation-layer output."""
 
     probability_insider: float
     confidence: str
     short_summary: str
+    llm_version: str | None = None
+    prompt_hash: str | None = None
+    prompt_version: str | None = None
+    deterministic_prior_probability: float | None = None
+    probability_adjustment: float | None = None
+    fallback_reason: str | None = None
 
 
 def _parse_iso8601_utc(value: Any) -> datetime | None:
@@ -64,6 +78,36 @@ def _parse_iso8601_utc(value: Any) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _isoformat(dt: datetime | None) -> Optional[str]:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
+
+
+def _json_serial_default(obj: Any) -> Any:
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    if isinstance(obj, date):
+        return obj.isoformat()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    return value
 
 
 def _get_ollama_config(
@@ -103,15 +147,11 @@ def _fetch_event_raw(
 
 
 def _fetch_event_db(event_id: str) -> Dict[str, Any] | None:
-    """
-    Load event metadata from PostgreSQL if available.
-    """
     event = get_event_from_db(event_id)
     if not event:
         return None
     if isinstance(event, dict):
         return dict(event)
-    # psycopg2 RealDictRow behaves like a mapping, normalize to plain dict.
     try:
         return dict(event)
     except Exception as exc:
@@ -124,22 +164,15 @@ def _is_event_active(event: Dict[str, Any]) -> bool:
 
 
 def _cache_event_in_db(event: Dict[str, Any]) -> None:
-    """
-    Best-effort cache of slow-changing event metadata in PostgreSQL.
-    """
     if not _is_event_active(event):
         return
     try:
         insert_event_to_db(event)
     except Exception as exc:
-        # Do not fail scoring if DB cache is temporarily unavailable.
         print(f"[insider-model] Failed to cache event in DB: {exc}", flush=True)
 
 
 def _fetch_recent_spikes_db(event_id: str, limit: int = 5) -> List[Dict[str, Any]]:
-    """
-    Load recently detected spikes for this event from PostgreSQL.
-    """
     try:
         rows = get_recent_whale_spikes(event_id, limit=limit) or []
     except Exception as exc:
@@ -159,18 +192,18 @@ def _fetch_recent_spikes_db(event_id: str, limit: int = 5) -> List[Dict[str, Any
 def _simplify_event(event: Dict[str, Any]) -> Dict[str, Any]:
     markets = event.get("markets") or []
     simple_markets: List[Dict[str, Any]] = []
-    for m in markets:
-        if not isinstance(m, dict):
+    for market in markets:
+        if not isinstance(market, dict):
             continue
         simple_markets.append(
             {
-                "id": m.get("id"),
-                "slug": m.get("slug"),
-                "title": m.get("title") or m.get("question"),
-                "closed": m.get("closed"),
-                "end_date": m.get("endDate") or m.get("end_date"),
-                "volume": m.get("volume"),
-                "liquidity": m.get("liquidity"),
+                "id": market.get("id"),
+                "slug": market.get("slug"),
+                "title": market.get("title") or market.get("question"),
+                "closed": market.get("closed"),
+                "end_date": market.get("endDate") or market.get("end_date"),
+                "volume": market.get("volume"),
+                "liquidity": market.get("liquidity"),
             }
         )
 
@@ -182,33 +215,15 @@ def _simplify_event(event: Dict[str, Any]) -> Dict[str, Any]:
         "category": event.get("category"),
         "sub_category": event.get("subCategory") or event.get("sub_category"),
         "created_at": event.get("created_at") or event.get("createdAt"),
-        "resolution_source": event.get("resolutionSource")
-        or event.get("resolution_source"),
+        "resolution_source": event.get("resolutionSource") or event.get("resolution_source"),
         "markets": simple_markets,
     }
-
-
-def _isoformat(dt: datetime | None) -> Optional[str]:
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).isoformat()
 
 
 def _resolve_signal_time(
     trigger_context: Dict[str, Any] | None,
     fresh_market_data: Dict[str, Any] | None,
 ) -> tuple[datetime, str]:
-    """
-    Pick the timestamp that best represents when the suspicious activity happened.
-
-    Preference order:
-    1. Explicit trigger timestamp passed by caller.
-    2. Trigger payload spike end timestamp (`to_ts`) from insider_detection.
-    3. Fresh market-data capture time near the trigger.
-    4. Current time as a last-resort fallback.
-    """
     if isinstance(trigger_context, dict):
         explicit_signal_time = _parse_iso8601_utc(trigger_context.get("signal_time"))
         if explicit_signal_time is not None:
@@ -216,7 +231,7 @@ def _resolve_signal_time(
 
         trigger_payload = trigger_context.get("trigger_payload")
         if isinstance(trigger_payload, dict):
-            for key in ("to_ts", "captured_at", "timestamp", "triggered_at"):
+            for key in ("signal_time", "to_ts", "captured_at", "timestamp", "triggered_at"):
                 parsed = _parse_iso8601_utc(trigger_payload.get(key))
                 if parsed is not None:
                     return parsed, f"trigger_context.trigger_payload.{key}"
@@ -229,19 +244,223 @@ def _resolve_signal_time(
     return datetime.now(timezone.utc), "generated_at_fallback"
 
 
-def _build_feature_payload(
+def _bounded_probability_adjustment(value: Any) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(-MAX_PROBABILITY_ADJUSTMENT, min(MAX_PROBABILITY_ADJUSTMENT, numeric))
+
+
+def _clamp_probability(value: Any, default: float = 0.0) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        numeric = default
+    return max(0.0, min(1.0, numeric))
+
+
+def _deterministic_prior_probability(score: Any, band: Any) -> float:
+    try:
+        score_value = max(0.0, min(100.0, float(score)))
+    except (TypeError, ValueError):
+        return 0.5
+
+    band_name = str(band or "").strip().lower()
+    band_ranges = {
+        "low": (0.05, 0.35, 0.0, 35.0),
+        "elevated": (0.30, 0.60, 35.0, 55.0),
+        "high": (0.52, 0.78, 55.0, 75.0),
+        "severe": (0.70, 0.92, 75.0, 100.0),
+    }
+    low_prob, high_prob, low_score, high_score = band_ranges.get(
+        band_name,
+        (0.10, 0.90, 0.0, 100.0),
+    )
+    span = max(high_score - low_score, 1.0)
+    position = max(0.0, min(1.0, (score_value - low_score) / span))
+    return round(low_prob + (high_prob - low_prob) * position, 3)
+
+
+def _metadata_path_for_news(news_path: str | Path) -> Path:
+    path = Path(news_path)
+    return path.with_suffix(".metadata.json")
+
+
+def _describe_news_dataset(news_path: str | Path) -> Dict[str, Any]:
+    path = Path(news_path)
+    metadata_path = _metadata_path_for_news(path)
+    result: Dict[str, Any] = {
+        "path": str(path),
+        "metadata_path": str(metadata_path),
+        "exists": path.exists(),
+        "metadata_exists": metadata_path.exists(),
+    }
+
+    if path.exists():
+        stat = path.stat()
+        result.update(
+            {
+                "size_bytes": stat.st_size,
+                "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+            }
+        )
+
+    if metadata_path.exists():
+        try:
+            result["metadata"] = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            result["metadata_error"] = str(exc)
+
+    return result
+
+
+def _top_component_scores(snapshot: Dict[str, Any], limit: int = 4) -> List[Dict[str, Any]]:
+    component_scores = snapshot.get("component_scores")
+    if not isinstance(component_scores, dict):
+        return []
+
+    scored: list[tuple[str, float]] = []
+    for name, value in component_scores.items():
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            continue
+        if numeric <= 0.0:
+            continue
+        scored.append((str(name), numeric))
+
+    scored.sort(key=lambda item: item[1], reverse=True)
+    return [{"name": name, "value": round(value, 4)} for name, value in scored[:limit]]
+
+
+def _build_evidence_highlights(trigger_payload: Dict[str, Any], snapshot: Dict[str, Any]) -> List[str]:
+    highlights: list[str] = []
+    for item in _top_component_scores(snapshot):
+        highlights.append(f"{item['name']}={item['value']}")
+
+    gating = snapshot.get("gating")
+    if isinstance(gating, dict):
+        gate_reason = str(gating.get("llm_gate_reason") or "").strip()
+        if gate_reason:
+            highlights.append(f"llm_gate_reason={gate_reason}")
+        if gating.get("pre_news") is True:
+            highlights.append("pre_news_signal=true")
+        if gating.get("repeated_anomaly") is True:
+            highlights.append("repeated_anomaly=true")
+
+    news_delta = trigger_payload.get("news_delta_minutes")
+    try:
+        news_delta_value = float(news_delta)
+    except (TypeError, ValueError):
+        news_delta_value = None
+    if news_delta_value is not None:
+        if news_delta_value > 0:
+            highlights.append(f"news_followed_signal_by_{round(news_delta_value, 2)}m")
+        elif news_delta_value < 0:
+            highlights.append(f"news_led_signal_by_{round(abs(news_delta_value), 2)}m")
+
+    return highlights
+
+
+def _build_payload_from_trigger(
+    event_id: str,
+    *,
+    news_path: str,
+    trigger_context: Dict[str, Any] | None,
+    fresh_market_data: Dict[str, Any] | None,
+) -> Dict[str, Any] | None:
+    if not isinstance(trigger_context, dict):
+        return None
+
+    trigger_payload = trigger_context.get("trigger_payload")
+    if not isinstance(trigger_payload, dict):
+        return None
+
+    snapshot = trigger_payload.get("deterministic_feature_snapshot")
+    if not isinstance(snapshot, dict):
+        snapshot = {}
+
+    prior_probability = _deterministic_prior_probability(
+        trigger_payload.get("deterministic_score"),
+        trigger_payload.get("deterministic_score_band"),
+    )
+    signal_time, signal_time_source = _resolve_signal_time(trigger_context, fresh_market_data)
+
+    return {
+        "schema_version": EXPLANATION_PAYLOAD_VERSION,
+        "prompt_version": PROMPT_VERSION,
+        "public_data_only": True,
+        "llm_role": "explanation_confidence_refinement",
+        "legal_determination": False,
+        "event_reference": {
+            "event_id": event_id,
+            "market_id": trigger_payload.get("market_id"),
+            "side": trigger_payload.get("side"),
+        },
+        "trigger_contract": {
+            "spike_id": trigger_payload.get("spike_id"),
+            "event_id": trigger_payload.get("event_id") or event_id,
+            "market_id": trigger_payload.get("market_id"),
+            "side": trigger_payload.get("side"),
+            "from_ts": trigger_payload.get("from_ts"),
+            "to_ts": trigger_payload.get("to_ts"),
+            "deterministic_score": trigger_payload.get("deterministic_score"),
+            "deterministic_score_band": trigger_payload.get("deterministic_score_band"),
+            "deterministic_feature_snapshot": snapshot,
+            "scorer_version": trigger_payload.get("scorer_version"),
+            "trigger_type": trigger_payload.get("trigger_type"),
+            "signal_time": trigger_payload.get("signal_time") or _isoformat(signal_time),
+            "news_time": trigger_payload.get("news_time"),
+            "news_delta_minutes": trigger_payload.get("news_delta_minutes"),
+            "llm_probability": trigger_payload.get("llm_probability"),
+            "llm_confidence": trigger_payload.get("llm_confidence"),
+            "llm_summary": trigger_payload.get("llm_summary"),
+            "llm_version": trigger_payload.get("llm_version"),
+            "prompt_hash": trigger_payload.get("prompt_hash"),
+        },
+        "deterministic_prior": {
+            "probability": prior_probability,
+            "max_adjustment": MAX_PROBABILITY_ADJUSTMENT,
+            "score": trigger_payload.get("deterministic_score"),
+            "band": trigger_payload.get("deterministic_score_band"),
+            "scorer_version": trigger_payload.get("scorer_version"),
+        },
+        "deterministic_evidence": {
+            "feature_snapshot_contract": (
+                snapshot.get("snapshot_contract_version")
+                or FEATURE_SNAPSHOT_CONTRACT_VERSION
+            ),
+            "component_scores": snapshot.get("component_scores") or {},
+            "aggregates": snapshot.get("aggregates") or {},
+            "gating": snapshot.get("gating") or {},
+            "raw_features": snapshot.get("raw_features") or {},
+            "market_context": snapshot.get("market_context") or {},
+            "price_context": snapshot.get("price_context") or {},
+            "orderbook_context": snapshot.get("orderbook_context") or {},
+            "trade_context": snapshot.get("trade_context") or {},
+            "open_interest_context": snapshot.get("open_interest_context") or {},
+            "news_context": snapshot.get("news_context") or {},
+            "evidence_highlights": _build_evidence_highlights(trigger_payload, snapshot),
+        },
+        "point_in_time_context": {
+            "signal_time": trigger_payload.get("signal_time") or _isoformat(signal_time),
+            "signal_time_source": signal_time_source,
+            "fresh_market_data": _json_safe(fresh_market_data),
+            "news_dataset": _describe_news_dataset(news_path),
+        },
+    }
+
+
+def _build_legacy_live_payload(
     event_id: str,
     *,
     base_url: str,
-    news_path: str = "data/news_events.jsonl",
+    news_path: str = "news_scraper/data/news_events.jsonl",
     include_db_event: bool = True,
     trigger_context: Dict[str, Any] | None = None,
     fresh_market_data: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
-    """
-    Collect event metadata and derived signals into a single JSON-serialisable
-    payload to feed into the Ollama model.
-    """
     event_raw = _fetch_event_raw(event_id, base_url=base_url)
     _cache_event_in_db(event_raw)
     event_simple = _simplify_event(event_raw)
@@ -262,15 +481,11 @@ def _build_feature_payload(
         base_url=base_url,
     )
 
-    now_utc = datetime.now(timezone.utc)
     fresh_data = fresh_market_data or fetch_fresh_market_data_from_api(
         event_id,
         base_url=base_url,
     )
-    signal_time, signal_time_source = _resolve_signal_time(
-        trigger_context,
-        fresh_data,
-    )
+    signal_time, signal_time_source = _resolve_signal_time(trigger_context, fresh_data)
     news_timing: Optional[NewsTiming] = find_nearest_news_for_event(
         event_id,
         signal_time=signal_time,
@@ -278,85 +493,96 @@ def _build_feature_payload(
         news_path=news_path,
     )
 
-    def _asdict_list(objs):
-        return [asdict(o) for o in objs]
+    def _asdict_list(objs: List[Any]) -> List[Dict[str, Any]]:
+        return [asdict(obj) for obj in objs]
 
-    payload: Dict[str, Any] = {
+    return {
+        "schema_version": LEGACY_LIVE_PAYLOAD_VERSION,
+        "prompt_version": PROMPT_VERSION,
+        "public_data_only": True,
+        "llm_role": "legacy_explanation_fallback",
+        "legal_determination": False,
         "event": event_simple,
         "event_db": event_db,
         "recent_whale_spikes_db": recent_spikes_db,
-        "generated_at": _isoformat(now_utc),
-        "signal_time_for_news": _isoformat(signal_time),
+        "signal_time": _isoformat(signal_time),
         "signal_time_source": signal_time_source,
-        "news_timing_interpretation": {
-            "signal_time_definition": (
-                "Approximate time when the suspicious trade/spike/trigger happened."
-            ),
-            "positive_delta_minutes_means": (
-                "News arrived after the signal time, so trading/spike happened before news."
-            ),
-            "negative_delta_minutes_means": (
-                "News arrived before the signal time, so trading/spike happened after news."
-            ),
+        "fresh_market_data": _json_safe(fresh_data),
+        "news_dataset": _describe_news_dataset(news_path),
+        "legacy_live_features": {
+            "volume_stats": asdict(volume),
+            "orderbook_imbalance": _asdict_list(orderbooks),
+            "open_interest": _asdict_list(oi_snapshots),
+            "price_history_stats": _asdict_list(price_stats),
+            "news_timing": asdict(news_timing) if news_timing is not None else None,
         },
-        "fresh_market_data": fresh_data,
-        "volume_stats": asdict(volume),
-        "orderbook_imbalance": _asdict_list(orderbooks),
-        "open_interest": _asdict_list(oi_snapshots),
-        "price_history_stats": _asdict_list(price_stats),
-        "news_timing": asdict(news_timing) if news_timing is not None else None,
-        "trigger_context": trigger_context,
+        "deterministic_prior": {
+            "probability": 0.5,
+            "max_adjustment": 0.0,
+            "score": None,
+            "band": None,
+            "scorer_version": None,
+        },
     }
-    return payload
 
 
-def _json_serial_default(obj: Any) -> Any:
-    """Convert non-JSON-serializable values for json.dumps (e.g. datetime from DB)."""
-    if isinstance(obj, datetime):
-        return obj.isoformat()
-    if isinstance(obj, date):
-        return obj.isoformat()
-    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+def _build_explanation_payload(
+    event_id: str,
+    *,
+    base_url: str,
+    news_path: str = "news_scraper/data/news_events.jsonl",
+    include_db_event: bool = True,
+    trigger_context: Dict[str, Any] | None = None,
+    fresh_market_data: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    frozen_payload = _build_payload_from_trigger(
+        event_id,
+        news_path=news_path,
+        trigger_context=trigger_context,
+        fresh_market_data=fresh_market_data,
+    )
+    if frozen_payload is not None:
+        return frozen_payload
+
+    return _build_legacy_live_payload(
+        event_id,
+        base_url=base_url,
+        news_path=news_path,
+        include_db_event=include_db_event,
+        trigger_context=trigger_context,
+        fresh_market_data=fresh_market_data,
+    )
 
 
 def _build_prompt(features: Dict[str, Any]) -> str:
-    """
-    Build a single JSON-heavy prompt for the Ollama model.
-    """
     features_json = json.dumps(
-        features, indent=2, sort_keys=True, default=_json_serial_default
+        features,
+        indent=2,
+        sort_keys=True,
+        default=_json_serial_default,
     )
     return (
-        "You are an expert quantitative analyst focused on prediction markets, "
-        "order books, and market microstructure. You are given a Polymarket event "
-        "and a recent snapshot of trading activity and news.\n\n"
-        "Your task is to estimate the probability that the current trading "
-        "pattern for this event is driven by materially informed or insider "
-        "trading (i.e. traders with significantly better information than the "
-        "typical retail crowd), as opposed to ordinary speculative or noise trading.\n\n"
-        "You must treat this as a heuristic risk score, not a legal judgement. "
-        "Consider price moves, volume spikes, buy/sell imbalance, order book "
-        "depth and imbalance, changes in open interest, abnormal price history "
-        "patterns (e.g. outlier moves vs recent volatility), and the timing of "
-        "relevant news.\n\n"
-        "When interpreting `news_timing`, compare the news timestamp to the "
-        "provided signal/trigger time rather than the assessment runtime. "
-        "DO NOT treat positive `delta_minutes` as evidence that suspicious activity, just disregard news and timing of news for now completely " #Treat positive `delta_minutes` as evidence that suspicious activity 
-        "happened before the relevant news, and negative `delta_minutes` as "
-        "evidence that suspicious activity happened after the news. Post-news "
-        "activity is usually less indicative of insider trading than pre-news "
-        "activity, all else equal.\n\n"
-        "You will receive a JSON object with event metadata and derived signals:\n"
-        f"{features_json}\n\n"
-        "Return ONLY a single JSON object with the following fields:\n"
-        '{\n'
-        '  "probability_insider": <float between 0 and 1>,\n'
+        "You are a conservative research analyst for public-data prediction-market anomalies.\n\n"
+        "The deterministic scorer is the primary classifier. You are NOT allowed to replace it. "
+        "Your role is limited to explanation, confidence refinement, and at most a small bounded "
+        "adjustment around the deterministic prior probability.\n\n"
+        "Rules:\n"
+        "- Use only the provided JSON payload.\n"
+        "- Do not make legal accusations or definitive insider-trading claims.\n"
+        "- Use phrases like suspicious activity, anomaly, research signal, or public-data signal.\n"
+        "- Treat positive `news_delta_minutes` as the signal occurring before the nearby public news.\n"
+        "- Treat negative `news_delta_minutes` as the signal occurring after the nearby public news.\n"
+        f"- If `deterministic_prior.max_adjustment` is non-zero, `probability_adjustment` must stay within +/-{MAX_PROBABILITY_ADJUSTMENT:.2f}.\n"
+        "- If the evidence is incomplete or mixed, keep the adjustment near 0 and lower confidence.\n"
+        "- Focus on frozen deterministic evidence and point-in-time context, not current market conditions.\n\n"
+        "Return ONLY one JSON object with this exact schema:\n"
+        "{\n"
+        '  "probability_adjustment": <float>,\n'
         '  "confidence": "low" | "medium" | "high",\n'
-        '  "short_summary": "<one or two concise sentences explaining why>"\n'
+        '  "short_summary": "<one or two concise sentences>"\n'
         "}\n\n"
-        "The probability should reflect how likely it is that INFORMED or insider "
-        "traders are significantly influencing the observed market activity.\n"
-        "Be conservative: reserve probabilities above 0.7 for very strong signals."
+        "Payload:\n"
+        f"{features_json}"
     )
 
 
@@ -396,6 +622,8 @@ def _extract_text_content(value: Any) -> str:
 
 
 def _extract_response_content(payload: Dict[str, Any]) -> str:
+    if all(key in payload for key in ("probability_adjustment", "confidence", "short_summary")):
+        return json.dumps(payload)
     if all(key in payload for key in ("probability_insider", "confidence", "short_summary")):
         return json.dumps(payload)
 
@@ -442,26 +670,16 @@ def _request_ollama_assessment(
 
     response = client.post(
         api_url,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-        },
+        headers={"Authorization": f"Bearer {api_key}"},
         json={
             "model": model,
             "messages": [
-                {
-                    "role": "system",
-                    "content": system_prompt,
-                },
-                {
-                    "role": "user",
-                    "content": user_prompt,
-                },
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
             ],
             "stream": False,
             "format": "json",
-            "options": {
-                "temperature": temperature,
-            },
+            "options": {"temperature": temperature},
         },
     )
     try:
@@ -484,55 +702,78 @@ def _request_ollama_assessment(
     return _extract_json_object(content)
 
 
-def assess_insider_probability_for_event(
-    event_id: str,
+def _assessment_from_parsed_response(
+    parsed: Dict[str, Any],
     *,
-    base_url: str = DEFAULT_BASE_URL,
-    ollama_host: Optional[str] = None,
-    ollama_api_key: Optional[str] = None,
-    model: Optional[str] = None,
-    news_path: str = "data/news_events.jsonl",
-    temperature: float = 0.1,
-    include_db_event: bool = True,
-    trigger_context: Dict[str, Any] | None = None,
-    fresh_market_data: Dict[str, Any] | None = None,
+    model: str,
+    prompt_hash: str,
+    prior_probability: float,
 ) -> InsiderAssessment:
-    """
-    High-level helper: call Ollama to estimate insider-trading likelihood.
+    adjustment = parsed.get("probability_adjustment")
+    if adjustment is None and "probability_insider" in parsed:
+        adjustment = _clamp_probability(parsed.get("probability_insider"), default=prior_probability) - prior_probability
+    bounded_adjustment = _bounded_probability_adjustment(adjustment)
+    final_probability = _clamp_probability(prior_probability + bounded_adjustment, default=prior_probability)
 
-    Args:
-        event_id: Polymarket event ID.
-        base_url: Base URL of your local Polymarket proxy (default 127.0.0.1:8000).
-        ollama_host: Optional override; otherwise uses OLLAMA_HOST or `https://ollama.com`.
-        ollama_api_key: Optional override; otherwise uses OLLAMA_API_KEY.
-        model: Ollama cloud model name. If omitted, uses OLLAMA_MODEL or `qwen3.5:cloud`.
-        news_path: Path to `news_events.jsonl` for the news-timing feature.
-        temperature: Sampling temperature for the model (default 0.1).
-        include_db_event: Include PostgreSQL event row in model features.
-        trigger_context: Optional metadata about why assessment was triggered.
-        fresh_market_data: Optional trigger-time snapshot (e.g. websocket cache).
-            If omitted, a fresh API snapshot is fetched automatically.
-    """
-    ollama_host, ollama_model, ollama_api_key = _get_ollama_config(
-        host=ollama_host,
-        model=model,
-        api_key=ollama_api_key,
+    confidence = str(parsed.get("confidence") or "low").strip().lower()
+    if confidence not in {"low", "medium", "high"}:
+        confidence = "low"
+
+    summary = str(parsed.get("short_summary") or "").strip() or DEFAULT_SUMMARY_FALLBACK
+
+    return InsiderAssessment(
+        probability_insider=final_probability,
+        confidence=confidence,
+        short_summary=summary,
+        llm_version=model,
+        prompt_hash=prompt_hash,
+        prompt_version=PROMPT_VERSION,
+        deterministic_prior_probability=prior_probability,
+        probability_adjustment=bounded_adjustment,
     )
-    features = _build_feature_payload(
-        event_id,
-        base_url=base_url,
-        news_path=news_path,
-        include_db_event=include_db_event,
-        trigger_context=trigger_context,
-        fresh_market_data=fresh_market_data,
+
+
+def _fallback_assessment(
+    *,
+    model: str,
+    prompt_hash: str,
+    prior_probability: float,
+    reason: str,
+) -> InsiderAssessment:
+    return InsiderAssessment(
+        probability_insider=prior_probability,
+        confidence="low",
+        short_summary=DEFAULT_SUMMARY_FALLBACK,
+        llm_version=model,
+        prompt_hash=prompt_hash,
+        prompt_version=PROMPT_VERSION,
+        deterministic_prior_probability=prior_probability,
+        probability_adjustment=0.0,
+        fallback_reason=reason,
     )
-    prompt = _build_prompt(features)
+
+
+def _assess_with_payload(
+    explanation_payload: Dict[str, Any],
+    *,
+    ollama_host: str,
+    ollama_model: str,
+    ollama_api_key: str,
+    temperature: float,
+    event_id: str,
+) -> InsiderAssessment:
+    prompt = _build_prompt(explanation_payload)
+    prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    prior_probability = _clamp_probability(
+        ((explanation_payload.get("deterministic_prior") or {}).get("probability")),
+        default=0.5,
+    )
 
     system_prompt = (
-        "You are a careful, risk-averse quantitative analyst whose "
-        "job is to flag patterns that *might* indicate informed or "
-        "insider trading in prediction markets."
+        "You explain public-data anomaly evidence. The deterministic scorer remains the "
+        "primary classifier, and you must stay conservative and audit-friendly."
     )
+
     with httpx.Client(timeout=120.0) as client:
         try:
             parsed = _request_ollama_assessment(
@@ -546,7 +787,7 @@ def assess_insider_probability_for_event(
             )
         except RuntimeError as first_error:
             print(
-                f"[insider-model] Retrying Ollama assessment for event {event_id} after malformed response: {first_error}",
+                f"[insider-model] Retrying explanation-layer assessment for event {event_id} after malformed response: {first_error}",
                 flush=True,
             )
             try:
@@ -562,29 +803,106 @@ def assess_insider_probability_for_event(
                 )
             except RuntimeError as retry_error:
                 print(
-                    f"[insider-model] Ollama assessment fallback used for event {event_id}: {retry_error}",
+                    f"[insider-model] Explanation-layer fallback used for event {event_id}: {retry_error}",
                     flush=True,
                 )
-                return InsiderAssessment(
-                    probability_insider=0.0,
-                    confidence="low",
-                    short_summary="Ollama returned an invalid or empty JSON response; assessment unavailable for this spike.",
+                return _fallback_assessment(
+                    model=ollama_model,
+                    prompt_hash=prompt_hash,
+                    prior_probability=prior_probability,
+                    reason="malformed_or_unavailable_response",
                 )
 
-    prob = float(parsed.get("probability_insider", 0.0))
-    # Clamp to [0, 1] for safety.
-    prob = max(0.0, min(1.0, prob))
-    confidence = str(parsed.get("confidence") or "low")
-    summary = str(parsed.get("short_summary") or "").strip()
+    return _assessment_from_parsed_response(
+        parsed,
+        model=ollama_model,
+        prompt_hash=prompt_hash,
+        prior_probability=prior_probability,
+    )
 
-    return InsiderAssessment(
-        probability_insider=prob,
-        confidence=confidence,
-        short_summary=summary,
+
+def assess_insider_probability_from_payload(
+    trigger_payload: Dict[str, Any],
+    *,
+    event_id: str | None = None,
+    ollama_host: Optional[str] = None,
+    ollama_api_key: Optional[str] = None,
+    model: Optional[str] = None,
+    news_path: str = "news_scraper/data/news_events.jsonl",
+    temperature: float = 0.1,
+    fresh_market_data: Dict[str, Any] | None = None,
+) -> InsiderAssessment:
+    resolved_event_id = str(
+        event_id
+        or trigger_payload.get("event_id")
+        or trigger_payload.get("market_id")
+        or "unknown-event"
+    )
+    explanation_payload = _build_payload_from_trigger(
+        resolved_event_id,
+        news_path=news_path,
+        trigger_context={"trigger_payload": trigger_payload},
+        fresh_market_data=fresh_market_data,
+    )
+    if explanation_payload is None:
+        raise ValueError("Trigger payload must include a deterministic feature snapshot.")
+
+    ollama_host, ollama_model, ollama_api_key = _get_ollama_config(
+        host=ollama_host,
+        model=model,
+        api_key=ollama_api_key,
+    )
+    return _assess_with_payload(
+        explanation_payload,
+        ollama_host=ollama_host,
+        ollama_model=ollama_model,
+        ollama_api_key=ollama_api_key,
+        temperature=temperature,
+        event_id=resolved_event_id,
+    )
+
+
+def assess_insider_probability_for_event(
+    event_id: str,
+    *,
+    base_url: str = DEFAULT_BASE_URL,
+    ollama_host: Optional[str] = None,
+    ollama_api_key: Optional[str] = None,
+    model: Optional[str] = None,
+    news_path: str = "news_scraper/data/news_events.jsonl",
+    temperature: float = 0.1,
+    include_db_event: bool = True,
+    trigger_context: Dict[str, Any] | None = None,
+    fresh_market_data: Dict[str, Any] | None = None,
+) -> InsiderAssessment:
+    ollama_host, ollama_model, ollama_api_key = _get_ollama_config(
+        host=ollama_host,
+        model=model,
+        api_key=ollama_api_key,
+    )
+    explanation_payload = _build_explanation_payload(
+        event_id,
+        base_url=base_url,
+        news_path=news_path,
+        include_db_event=include_db_event,
+        trigger_context=trigger_context,
+        fresh_market_data=fresh_market_data,
+    )
+    return _assess_with_payload(
+        explanation_payload,
+        ollama_host=ollama_host,
+        ollama_model=ollama_model,
+        ollama_api_key=ollama_api_key,
+        temperature=temperature,
+        event_id=event_id,
     )
 
 
 __all__ = [
+    "EXPLANATION_PAYLOAD_VERSION",
+    "MAX_PROBABILITY_ADJUSTMENT",
+    "PROMPT_VERSION",
     "InsiderAssessment",
     "assess_insider_probability_for_event",
+    "assess_insider_probability_from_payload",
 ]

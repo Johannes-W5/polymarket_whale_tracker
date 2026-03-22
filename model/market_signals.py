@@ -19,8 +19,9 @@ background jobs, or FastAPI routes.
 """
 
 import json
+import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from statistics import mean, pstdev
 from typing import Any, Iterable, List, Optional, Sequence, Tuple
@@ -85,6 +86,58 @@ def _select_condition_id(market: dict[str, Any]) -> Optional[str]:
     return str(cid)
 
 
+def _coerce_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+@dataclass
+class MarketMetadata:
+    event_id: str
+    market_id: str
+    title: str | None
+    liquidity: float | None
+    volume: float | None
+    yes_token_id: str | None
+    no_token_id: str | None
+
+
+def fetch_primary_market_metadata(
+    event_id: str,
+    *,
+    base_url: str | None = None,
+    market_index: int = 0,
+    timeout: float = 30.0,
+) -> MarketMetadata | None:
+    event = _fetch_event(event_id, base_url=base_url, timeout=timeout)
+    markets = _extract_markets_from_event(event)
+    if not markets:
+        return None
+    open_markets = [m for m in markets if isinstance(m, dict) and not m.get("closed", False)]
+    market = open_markets[0] if open_markets else (
+        markets[market_index] if market_index < len(markets) else markets[0]
+    )
+    if not isinstance(market, dict):
+        return None
+    yes_token_id, no_token_id = _parse_clob_token_ids(market)
+    market_id = market.get("id") or _select_condition_id(market)
+    if market_id is None:
+        return None
+    return MarketMetadata(
+        event_id=event_id,
+        market_id=str(market_id),
+        title=str(market.get("title") or market.get("question") or "").strip() or None,
+        liquidity=_coerce_float(market.get("liquidity")),
+        volume=_coerce_float(market.get("volume")),
+        yes_token_id=yes_token_id,
+        no_token_id=no_token_id,
+    )
+
+
 # ---------- Volume statistics (Data API /trades) ----------
 
 
@@ -95,6 +148,23 @@ class VolumeStats:
     buy_volume: float
     sell_volume: float
     trade_count: int
+
+
+@dataclass
+class TradeBurstStats:
+    event_id: str
+    as_of: datetime
+    recent_window_minutes: float
+    baseline_window_minutes: float
+    recent_trade_count: int
+    baseline_trade_count: float
+    trade_count_burst: float
+    recent_total_volume: float
+    baseline_total_volume: float
+    volume_burst: float
+    recent_buy_volume: float
+    recent_sell_volume: float
+    aggressor_imbalance: float
 
 
 def _fetch_event_trades(
@@ -182,6 +252,111 @@ def compute_volume_stats(
     )
 
 
+def _parse_trade_time(raw_trade: dict[str, Any]) -> datetime | None:
+    for key in (
+        "timestamp",
+        "createdAt",
+        "created_at",
+        "matchTime",
+        "matchedAt",
+        "time",
+    ):
+        value = raw_trade.get(key)
+        if isinstance(value, (int, float)):
+            try:
+                ts_value = float(value)
+                if ts_value > 1_000_000_000_000:
+                    ts_value /= 1000.0
+                return datetime.fromtimestamp(ts_value, tz=timezone.utc)
+            except (OverflowError, OSError, ValueError):
+                continue
+        parsed = _parse_iso8601_utc(value if isinstance(value, str) else None)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def compute_trade_burst_stats(
+    event_id: str,
+    *,
+    base_url: str | None = None,
+    as_of: datetime | None = None,
+    recent_window_minutes: float = 5.0,
+    baseline_window_minutes: float = 60.0,
+    limit: int = 1000,
+    timeout: float = 30.0,
+) -> TradeBurstStats:
+    trades = _fetch_event_trades(
+        event_id,
+        base_url=base_url,
+        limit=limit,
+        timeout=timeout,
+    )
+    as_of_utc = (as_of or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    recent_start = as_of_utc - timedelta(minutes=max(recent_window_minutes, 1.0))
+    baseline_start = as_of_utc - timedelta(
+        minutes=max(recent_window_minutes + baseline_window_minutes, recent_window_minutes + 1.0)
+    )
+
+    recent_trade_count = 0
+    recent_total_volume = 0.0
+    recent_buy_volume = 0.0
+    recent_sell_volume = 0.0
+    older_trade_count = 0
+    older_total_volume = 0.0
+
+    for trade in trades:
+        trade_time = _parse_trade_time(trade)
+        if trade_time is None:
+            continue
+        if trade_time > as_of_utc or trade_time < baseline_start:
+            continue
+        size = _coerce_float(trade.get("size") or trade.get("amount"))
+        if size is None:
+            continue
+        size = abs(size)
+        side = str(trade.get("side") or trade.get("takerSide") or "").upper()
+        if trade_time >= recent_start:
+            recent_trade_count += 1
+            recent_total_volume += size
+            if side == "BUY":
+                recent_buy_volume += size
+            elif side == "SELL":
+                recent_sell_volume += size
+        else:
+            older_trade_count += 1
+            older_total_volume += size
+
+    baseline_windows = max(baseline_window_minutes / max(recent_window_minutes, 1.0), 1.0)
+    baseline_trade_count = older_trade_count / baseline_windows
+    baseline_total_volume = older_total_volume / baseline_windows
+
+    trade_count_burst = recent_trade_count / max(baseline_trade_count, 1.0)
+    volume_burst = recent_total_volume / max(baseline_total_volume, 1.0)
+    aggressor_total = recent_buy_volume + recent_sell_volume
+    aggressor_imbalance = (
+        (recent_buy_volume - recent_sell_volume) / aggressor_total
+        if aggressor_total > 0
+        else 0.0
+    )
+
+    return TradeBurstStats(
+        event_id=event_id,
+        as_of=as_of_utc,
+        recent_window_minutes=recent_window_minutes,
+        baseline_window_minutes=baseline_window_minutes,
+        recent_trade_count=recent_trade_count,
+        baseline_trade_count=baseline_trade_count,
+        trade_count_burst=trade_count_burst,
+        recent_total_volume=recent_total_volume,
+        baseline_total_volume=baseline_total_volume,
+        volume_burst=volume_burst,
+        recent_buy_volume=recent_buy_volume,
+        recent_sell_volume=recent_sell_volume,
+        aggressor_imbalance=aggressor_imbalance,
+    )
+
+
 # ---------- Order book imbalance (CLOB /book) ----------
 
 
@@ -193,6 +368,11 @@ class OrderbookImbalance:
     bid_depth: float
     ask_depth: float
     imbalance: float  # (bid_depth - ask_depth) / (bid_depth + ask_depth)
+    best_bid: float | None = None
+    best_ask: float | None = None
+    spread: float | None = None
+    spread_bps: float | None = None
+    depth_near_touch: float = 0.0
 
 
 def _fetch_order_book(
@@ -247,22 +427,52 @@ def compute_orderbook_imbalance_for_event(
         bids = book.get("bids") or []
         asks = book.get("asks") or []
 
+        def _extract_price_size(level: Any) -> tuple[float | None, float | None]:
+            try:
+                if isinstance(level, dict):
+                    raw_price = (
+                        level.get("price")
+                        or level.get("rate")
+                        or level.get("value")
+                    )
+                    raw_size = (
+                        level.get("size")
+                        or level.get("quantity")
+                        or level.get("amount")
+                    )
+                    return _coerce_float(raw_price), _coerce_float(raw_size)
+                if len(level) >= 2:
+                    return _coerce_float(level[0]), _coerce_float(level[1])
+            except (TypeError, KeyError):
+                return None, None
+            return None, None
+
         def _depth(levels: Sequence[Any]) -> float:
             depth = 0.0
             for lvl in list(levels)[:max_levels]:
-                try:
-                    if isinstance(lvl, dict):
-                        raw_size = (
-                            lvl.get("size")
-                            or lvl.get("quantity")
-                            or lvl.get("amount")
-                        )
-                    elif len(lvl) >= 2:
-                        raw_size = lvl[1]
-                    else:
-                        continue
-                    size = float(raw_size)
-                except (TypeError, ValueError, KeyError):
+                _, size = _extract_price_size(lvl)
+                if size is None:
+                    continue
+                depth += max(size, 0.0)
+            return depth
+
+        def _best_price(levels: Sequence[Any], *, highest: bool) -> float | None:
+            prices = []
+            for lvl in levels:
+                price, _ = _extract_price_size(lvl)
+                if price is None or price <= 0:
+                    continue
+                prices.append(price)
+            if not prices:
+                return None
+            return max(prices) if highest else min(prices)
+
+        def _top_level_depth(levels: Sequence[Any]) -> float:
+            top_levels = list(levels)[:2]
+            depth = 0.0
+            for lvl in top_levels:
+                _, size = _extract_price_size(lvl)
+                if size is None:
                     continue
                 depth += max(size, 0.0)
             return depth
@@ -271,6 +481,16 @@ def compute_orderbook_imbalance_for_event(
         ask_depth = _depth(asks)
         denom = bid_depth + ask_depth
         imbalance = (bid_depth - ask_depth) / denom if denom > 0 else 0.0
+        best_bid = _best_price(bids, highest=True)
+        best_ask = _best_price(asks, highest=False)
+        spread = None
+        spread_bps = None
+        if best_bid is not None and best_ask is not None and best_ask >= best_bid:
+            spread = best_ask - best_bid
+            mid = (best_ask + best_bid) / 2.0
+            if mid > 0:
+                spread_bps = (spread / mid) * 10_000.0
+        depth_near_touch = _top_level_depth(bids) + _top_level_depth(asks)
 
         results.append(
             OrderbookImbalance(
@@ -280,6 +500,11 @@ def compute_orderbook_imbalance_for_event(
                 bid_depth=bid_depth,
                 ask_depth=ask_depth,
                 imbalance=imbalance,
+                best_bid=best_bid,
+                best_ask=best_ask,
+                spread=spread,
+                spread_bps=spread_bps,
+                depth_near_touch=depth_near_touch,
             )
         )
 
@@ -391,6 +616,8 @@ class PriceHistoryStats:
     last_return: Optional[float]
     z_score: Optional[float]
     window: int
+    mean_return: Optional[float] = None
+    realized_volatility: Optional[float] = None
 
 
 def _fetch_price_history(
@@ -481,6 +708,8 @@ def compute_price_history_stats_for_event(
                         last_return=None,
                         z_score=None,
                         window=0,
+                        mean_return=None,
+                        realized_volatility=None,
                     )
                 )
                 continue
@@ -506,6 +735,8 @@ def compute_price_history_stats_for_event(
                         last_return=None,
                         z_score=None,
                         window=0,
+                        mean_return=None,
+                        realized_volatility=None,
                     )
                 )
                 continue
@@ -522,6 +753,8 @@ def compute_price_history_stats_for_event(
                 sigma = pstdev(window_slice)
                 z = (last_ret - mu) / sigma if sigma > 0 else 0.0
             else:
+                mu = None
+                sigma = None
                 z = None
 
             results.append(
@@ -532,6 +765,8 @@ def compute_price_history_stats_for_event(
                     last_return=last_ret,
                     z_score=z,
                     window=w,
+                    mean_return=mu,
+                    realized_volatility=sigma,
                 )
             )
 
@@ -543,6 +778,7 @@ def compute_price_history_stats_for_event(
 
 @dataclass
 class NewsRecord:
+    news_time: datetime
     ingested_at: datetime
     source: str
     title: str
@@ -557,6 +793,78 @@ class NewsTiming:
     delta_minutes: float  # news_time - signal_time (negative => news before signal)
     source: str
     title: str
+
+
+_NEWS_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "in",
+    "into",
+    "is",
+    "of",
+    "on",
+    "or",
+    "the",
+    "to",
+    "vs",
+    "will",
+    "with",
+}
+
+
+def _normalize_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+
+def _tokenize_keywords(value: str) -> list[str]:
+    return [
+        token
+        for token in _normalize_text(value).split()
+        if len(token) >= 3 and token not in _NEWS_STOPWORDS
+    ]
+
+
+def _build_event_news_terms(event: dict[str, Any]) -> tuple[str, set[str]]:
+    raw_title = str(event.get("title") or event.get("name") or "").strip()
+    raw_slug = str(event.get("slug") or "").replace("-", " ").strip()
+    title_normalized = _normalize_text(raw_title)
+
+    tokens = set(_tokenize_keywords(raw_title))
+    tokens.update(_tokenize_keywords(raw_slug))
+    return title_normalized, tokens
+
+
+def _record_matches_event(
+    record: NewsRecord,
+    *,
+    event_title: str,
+    event_terms: set[str],
+) -> bool:
+    haystack = _normalize_text(f"{record.title} {record.text}")
+    if not haystack:
+        return False
+
+    if event_title and len(event_title) >= 12 and event_title in haystack:
+        return True
+
+    if not event_terms:
+        return False
+
+    haystack_terms = set(haystack.split())
+    overlap = event_terms & haystack_terms
+    if len(overlap) >= 2:
+        return True
+
+    # For short event names like "Trump" or "Bitcoin", a single distinctive term
+    # can still be informative enough to count as a match.
+    return len(overlap) == 1 and any(len(term) >= 6 for term in overlap)
 
 
 def _load_news_records(path: str | Path) -> list[NewsRecord]:
@@ -585,16 +893,19 @@ def _load_news_records(path: str | Path) -> list[NewsRecord]:
                 title = str(rss.get("title") or "")
                 text = str(rss.get("summary") or "")
                 source = str(rss.get("source") or rss.get("link") or "rss")
+                news_time = _parse_iso8601_utc(rss.get("published")) or ingested_at
             elif "x" in raw:
                 x = raw.get("x") or {}
                 title = str(x.get("text") or "")
                 text = title
                 source = f"x:{x.get('query') or x.get('author_id') or ''}"
+                news_time = _parse_iso8601_utc(x.get("created_at")) or ingested_at
             else:
                 continue
 
             records.append(
                 NewsRecord(
+                    news_time=news_time,
                     ingested_at=ingested_at,
                     source=source,
                     title=title,
@@ -610,7 +921,7 @@ def find_nearest_news_for_event(
     signal_time: datetime,
     *,
     base_url: str | None = None,
-    news_path: str | Path = "data/news_events.jsonl",
+    news_path: str | Path = "news_scraper/data/news_events.jsonl",
     window_minutes: float = 120.0,
 ) -> Optional[NewsTiming]:
     """
@@ -624,21 +935,23 @@ def find_nearest_news_for_event(
       within `±window_minutes` of `signal_time`.
     """
     event = _fetch_event(event_id, base_url=base_url)
-    event_name = str(event.get("title") or event.get("name") or "").strip()
-    if not event_name:
+    event_title, event_terms = _build_event_news_terms(event)
+    if not event_title and not event_terms:
         return None
 
-    term = event_name.lower()
     news_records = _load_news_records(news_path)
     if not news_records:
         return None
 
     best: Optional[Tuple[NewsRecord, float]] = None
     for rec in news_records:
-        haystack = f"{rec.title} {rec.text}".lower()
-        if term not in haystack:
+        if not _record_matches_event(
+            rec,
+            event_title=event_title,
+            event_terms=event_terms,
+        ):
             continue
-        delta_sec = (rec.ingested_at - signal_time).total_seconds()
+        delta_sec = (rec.news_time - signal_time).total_seconds()
         delta_min = delta_sec / 60.0
         if abs(delta_min) > window_minutes:
             continue
@@ -652,7 +965,7 @@ def find_nearest_news_for_event(
     return NewsTiming(
         event_id=event_id,
         signal_time=signal_time.astimezone(timezone.utc),
-        news_time=rec.ingested_at,
+        news_time=rec.news_time,
         delta_minutes=delta_min,
         source=rec.source,
         title=rec.title,
@@ -660,14 +973,18 @@ def find_nearest_news_for_event(
 
 
 __all__ = [
+    "MarketMetadata",
     "VolumeStats",
+    "TradeBurstStats",
     "OrderbookImbalance",
     "OpenInterestSnapshot",
     "OpenInterestChange",
     "PriceHistoryStats",
     "NewsRecord",
     "NewsTiming",
+    "fetch_primary_market_metadata",
     "compute_volume_stats",
+    "compute_trade_burst_stats",
     "compute_orderbook_imbalance_for_event",
     "fetch_open_interest_for_event",
     "compute_open_interest_change",

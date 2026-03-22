@@ -13,6 +13,12 @@ from model.fresh_data import (
     InMemoryFreshDataStore,
     fetch_fresh_market_data_from_api,
 )
+from model.anomaly_scoring import (
+    AnomalyScoreInputs,
+    DeterministicAnomalyScore,
+    FEATURE_SNAPSHOT_CONTRACT_VERSION,
+    score_anomaly,
+)
 from model.event_cache import sync_events_to_db
 from model.insider_detection import (
     PriceSample,
@@ -27,6 +33,12 @@ from model.insider_detection import (
     monitor_event_and_assess_insider,
     monitor_events_and_assess_insider,
 )
+from model.insider_model import (
+    EXPLANATION_PAYLOAD_VERSION,
+    MAX_PROBABILITY_ADJUSTMENT,
+    PROMPT_VERSION,
+    assess_insider_probability_from_payload,
+)
 
 __all__ = [
     # Prices
@@ -37,6 +49,14 @@ __all__ = [
     "fetch_fresh_market_data_from_api",
     "InMemoryFreshDataStore",
     "sync_events_to_db",
+    "AnomalyScoreInputs",
+    "DeterministicAnomalyScore",
+    "FEATURE_SNAPSHOT_CONTRACT_VERSION",
+    "score_anomaly",
+    "EXPLANATION_PAYLOAD_VERSION",
+    "MAX_PROBABILITY_ADJUSTMENT",
+    "PROMPT_VERSION",
+    "assess_insider_probability_from_payload",
     # Whale tracking
     "PriceSample",
     "WhaleSpike",

@@ -30,6 +30,10 @@ class FreshMarketData:
     no_price: float | None
     yes_token_id: str | None
     no_token_id: str | None
+    market_id: str | None = None
+    market_title: str | None = None
+    market_liquidity: float | None = None
+    market_volume: float | None = None
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -40,6 +44,10 @@ class FreshMarketData:
             "no_price": self.no_price,
             "yes_token_id": self.yes_token_id,
             "no_token_id": self.no_token_id,
+            "market_id": self.market_id,
+            "market_title": self.market_title,
+            "market_liquidity": self.market_liquidity,
+            "market_volume": self.market_volume,
         }
 
 
@@ -61,6 +69,10 @@ def fetch_fresh_market_data_from_api(
         no_price=prices.no_price,
         yes_token_id=prices.yes_token_id,
         no_token_id=prices.no_token_id,
+        market_id=prices.market_id,
+        market_title=prices.market_title,
+        market_liquidity=prices.market_liquidity,
+        market_volume=prices.market_volume,
     )
     return payload.as_dict()
 

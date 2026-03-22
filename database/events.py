@@ -1,6 +1,7 @@
 # database/events.py
 from contextlib import closing
 from datetime import datetime
+import json
 from types import SimpleNamespace
 from typing import Any, Mapping
 
@@ -99,8 +100,30 @@ def insert_event(event):
 
 
 
+def _ensure_market_reference(cur, market_id: str | None, *, volume: float | None = None) -> None:
+    """
+    Ensure a minimal `markets` row exists before inserting rows with a market FK.
+    """
+    if market_id is None:
+        return
+    cur.execute(
+        """
+        INSERT INTO markets (id, volume_usd)
+        VALUES (%s, %s)
+        ON CONFLICT (id) DO UPDATE
+        SET volume_usd = COALESCE(EXCLUDED.volume_usd, markets.volume_usd);
+        """,
+        (str(market_id), volume),
+    )
+
+
 def insert_whale_spike(spike, market_id: str | None = None):
     with closing(get_connection()) as conn, conn.cursor() as cur:
+        _ensure_market_reference(
+            cur,
+            market_id,
+            volume=getattr(spike, "market_volume", None),
+        )
         cur.execute(
             """
             INSERT INTO whale_spikes (
@@ -146,21 +169,46 @@ def _ensure_insider_assessments_table(cur) -> None:
           id BIGSERIAL PRIMARY KEY,
           event_id TEXT NOT NULL,
           trigger_type TEXT NOT NULL,
+          spike_id TEXT NULL,
           market_id TEXT NULL,
           side TEXT NULL,
           from_ts TIMESTAMPTZ NULL,
           to_ts TIMESTAMPTZ NULL,
+          signal_time TIMESTAMPTZ NULL,
+          news_time TIMESTAMPTZ NULL,
+          news_delta_minutes DOUBLE PRECISION NULL,
           from_price DOUBLE PRECISION NULL,
           to_price DOUBLE PRECISION NULL,
           abs_change DOUBLE PRECISION NULL,
           rel_change DOUBLE PRECISION NULL,
-          probability_insider DOUBLE PRECISION NOT NULL,
-          confidence TEXT NOT NULL,
-          short_summary TEXT NOT NULL,
+          deterministic_score DOUBLE PRECISION NULL,
+          deterministic_score_band TEXT NULL,
+          deterministic_feature_snapshot JSONB NULL,
+          scorer_version TEXT NULL,
+          probability_insider DOUBLE PRECISION NULL,
+          confidence TEXT NULL,
+          short_summary TEXT NULL,
+          llm_version TEXT NULL,
+          prompt_hash TEXT NULL,
+          trigger_payload JSONB NULL,
           created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
         """
     )
+    cur.execute("ALTER TABLE insider_assessments ADD COLUMN IF NOT EXISTS spike_id TEXT NULL;")
+    cur.execute("ALTER TABLE insider_assessments ADD COLUMN IF NOT EXISTS signal_time TIMESTAMPTZ NULL;")
+    cur.execute("ALTER TABLE insider_assessments ADD COLUMN IF NOT EXISTS news_time TIMESTAMPTZ NULL;")
+    cur.execute("ALTER TABLE insider_assessments ADD COLUMN IF NOT EXISTS news_delta_minutes DOUBLE PRECISION NULL;")
+    cur.execute("ALTER TABLE insider_assessments ADD COLUMN IF NOT EXISTS deterministic_score DOUBLE PRECISION NULL;")
+    cur.execute("ALTER TABLE insider_assessments ADD COLUMN IF NOT EXISTS deterministic_score_band TEXT NULL;")
+    cur.execute("ALTER TABLE insider_assessments ADD COLUMN IF NOT EXISTS deterministic_feature_snapshot JSONB NULL;")
+    cur.execute("ALTER TABLE insider_assessments ADD COLUMN IF NOT EXISTS scorer_version TEXT NULL;")
+    cur.execute("ALTER TABLE insider_assessments ADD COLUMN IF NOT EXISTS llm_version TEXT NULL;")
+    cur.execute("ALTER TABLE insider_assessments ADD COLUMN IF NOT EXISTS prompt_hash TEXT NULL;")
+    cur.execute("ALTER TABLE insider_assessments ADD COLUMN IF NOT EXISTS trigger_payload JSONB NULL;")
+    cur.execute("ALTER TABLE insider_assessments ALTER COLUMN probability_insider DROP NOT NULL;")
+    cur.execute("ALTER TABLE insider_assessments ALTER COLUMN confidence DROP NOT NULL;")
+    cur.execute("ALTER TABLE insider_assessments ALTER COLUMN short_summary DROP NOT NULL;")
 
 
 def insert_insider_assessment(
@@ -168,44 +216,76 @@ def insert_insider_assessment(
     event_id: str,
     trigger_type: str,
     spike,
-    assessment,
+    assessment=None,
     market_id: str | None = None,
+    trigger_payload: dict[str, Any] | None = None,
 ):
     with closing(get_connection()) as conn, conn.cursor() as cur:
         _ensure_insider_assessments_table(cur)
+        _ensure_market_reference(
+            cur,
+            market_id,
+            volume=getattr(spike, "market_volume", None),
+        )
         cur.execute(
             """
             INSERT INTO insider_assessments (
               event_id,
               trigger_type,
+              spike_id,
               market_id,
               side,
               from_ts,
               to_ts,
+              signal_time,
+              news_time,
+              news_delta_minutes,
               from_price,
               to_price,
               abs_change,
               rel_change,
+              deterministic_score,
+              deterministic_score_band,
+              deterministic_feature_snapshot,
+              scorer_version,
               probability_insider,
               confidence,
-              short_summary
+              short_summary,
+              llm_version,
+              prompt_hash,
+              trigger_payload
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s::jsonb);
             """,
             (
                 str(event_id),
                 str(trigger_type),
+                getattr(spike, "spike_id", None),
                 market_id,
                 getattr(spike, "side", None),
                 getattr(spike, "from_ts", None),
                 getattr(spike, "to_ts", None),
+                getattr(spike, "signal_time", None),
+                getattr(spike, "news_time", None),
+                getattr(spike, "news_delta_minutes", None),
                 getattr(spike, "from_price", None),
                 getattr(spike, "to_price", None),
                 getattr(spike, "abs_change", None),
                 getattr(spike, "rel_change", None),
-                float(getattr(assessment, "probability_insider")),
-                str(getattr(assessment, "confidence")),
-                str(getattr(assessment, "short_summary")),
+                getattr(spike, "deterministic_score", None),
+                getattr(spike, "deterministic_score_band", None),
+                json.dumps(getattr(spike, "deterministic_feature_snapshot", None)),
+                getattr(spike, "scorer_version", None),
+                (
+                    float(getattr(assessment, "probability_insider"))
+                    if getattr(assessment, "probability_insider", None) is not None
+                    else None
+                ),
+                getattr(assessment, "confidence", None),
+                getattr(assessment, "short_summary", None),
+                getattr(assessment, "llm_version", None),
+                getattr(assessment, "prompt_hash", None),
+                json.dumps(trigger_payload) if trigger_payload is not None else None,
             ),
         )
         conn.commit()
@@ -281,17 +361,31 @@ def get_latest_assessment_for_event(event_id: str):
             SELECT
               event_id,
               trigger_type,
+              spike_id,
               market_id,
               side,
               from_ts,
               to_ts,
+              signal_time,
+              news_time,
+              news_delta_minutes,
               from_price,
               to_price,
               abs_change,
               rel_change,
+              deterministic_score,
+              deterministic_score_band,
+              deterministic_feature_snapshot,
+              scorer_version,
               probability_insider,
+              probability_insider AS llm_probability,
               confidence,
+              confidence AS llm_confidence,
               short_summary,
+              short_summary AS llm_summary,
+              llm_version,
+              prompt_hash,
+              trigger_payload,
               created_at
             FROM insider_assessments
             WHERE event_id = %s

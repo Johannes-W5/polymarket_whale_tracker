@@ -25,6 +25,10 @@ class EventPrices:
     no_price: float | None
     yes_token_id: str | None = None
     no_token_id: str | None = None
+    market_id: str | None = None
+    market_title: str | None = None
+    market_liquidity: float | None = None
+    market_volume: float | None = None
 
     @property
     def both(self) -> tuple[float | None, float | None]:
@@ -107,6 +111,21 @@ def get_event_prices(
         else:
             market = markets[0]
 
+        market_id = market.get("id")
+        market_title = market.get("title") or market.get("question")
+
+        def _to_float(val: Any) -> float | None:
+            """Parse numeric price from API (may be returned as string or number)."""
+            if val is None:
+                return None
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                return None
+
+        market_liquidity = _to_float(market.get("liquidity"))
+        market_volume = _to_float(market.get("volume"))
+
         yes_token_id, no_token_id = _parse_clob_token_ids(market)
         if not yes_token_id or not no_token_id:
             return EventPrices(
@@ -114,6 +133,10 @@ def get_event_prices(
                 no_price=None,
                 yes_token_id=yes_token_id,
                 no_token_id=no_token_id,
+                market_id=str(market_id) if market_id is not None else None,
+                market_title=str(market_title) if market_title else None,
+                market_liquidity=market_liquidity,
+                market_volume=market_volume,
             )
 
         # 2) Fetch both prices in one request (CLOB: token_ids and sides comma-separated)
@@ -130,20 +153,15 @@ def get_event_prices(
                 no_price=None,
                 yes_token_id=yes_token_id,
                 no_token_id=no_token_id,
+                market_id=str(market_id) if market_id is not None else None,
+                market_title=str(market_title) if market_title else None,
+                market_liquidity=market_liquidity,
+                market_volume=market_volume,
             )
         data: dict[str, dict[str, float]] = r.json()
 
         yes_map = data.get(yes_token_id) or {}
         no_map = data.get(no_token_id) or {}
-
-        def _to_float(val: Any) -> float | None:
-            """Parse numeric price from API (may be returned as string or number)."""
-            if val is None:
-                return None
-            try:
-                return float(val)
-            except (TypeError, ValueError):
-                return None
 
         yes_price = _to_float(yes_map.get(side))
         no_price = _to_float(no_map.get(side))
@@ -153,6 +171,10 @@ def get_event_prices(
             no_price=no_price,
             yes_token_id=yes_token_id,
             no_token_id=no_token_id,
+            market_id=str(market_id) if market_id is not None else None,
+            market_title=str(market_title) if market_title else None,
+            market_liquidity=market_liquidity,
+            market_volume=market_volume,
         )
 
 

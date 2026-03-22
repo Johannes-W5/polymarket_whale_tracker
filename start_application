@@ -1,4 +1,9 @@
-start application: 
+start application:
+
+Research analytics only:
+- public-data anomaly monitoring and explanation
+- no trading, execution, wallet, or account actions
+- outputs are suspicious-activity research signals, not legal determinations
 
 Terminal	Command
 cd server && python -m uvicorn main:app --reload
@@ -13,6 +18,12 @@ python -m model.insider_detection 2890 3100 --interval 5
 # defaults become stricter with --all-events: min_abs=0.05, min_rel=0.10
 python -m model.insider_detection --all-events --max-events 1000 (--all-events calls database/events.py with get_all_event_ids())
 
+# keep the news dataset fresh every 5 minutes
+python -m news_scraper.main --loop --interval-seconds 300
+
+# validate or replay frozen trigger payloads from a JSONL export
+python -m model.replay_evaluation --input path/to/triggers.jsonl
+
 
 source .venv/bin/activate
-streamlit run gui/app.py #set ollama key here also
+streamlit run gui/app.py # set OLLAMA_API_KEY / OLLAMA_MODEL in the shell if using the explanation layer
