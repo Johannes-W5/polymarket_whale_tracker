@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
 import streamlit as st
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -31,6 +32,34 @@ def _format_percent(value: Any) -> str:
         return f"{float(value) * 100:.1f}%"
     except (TypeError, ValueError):
         return "N/A"
+
+
+def _format_compact_number(value: Any) -> str:
+    if value is None:
+        return "N/A"
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return "N/A"
+    if n == 0:
+        return "0"
+
+    sign = "-" if n < 0 else ""
+    n = abs(n)
+    if n >= 1_000_000_000:
+        return f"{sign}{n / 1_000_000_000:.2f}B"
+    if n >= 1_000_000:
+        return f"{sign}{n / 1_000_000:.2f}M"
+    if n >= 1_000:
+        return f"{sign}{n / 1_000:.2f}K"
+    return f"{sign}{n:.2f}"
+
+
+def _polymarket_event_url(event: dict[str, Any]) -> str | None:
+    slug = str(event.get("slug") or "").strip()
+    if not slug:
+        return None
+    return f"https://polymarket.com/event/{slug}"
 
 
 @st.cache_data(ttl=5, show_spinner=False)
@@ -87,8 +116,11 @@ def _render_market_summary(event: dict[str, Any], market: dict[str, Any], event_
     st.write(f"**Event:** {event.get('title') or event.get('name') or event_id}")
     st.write(f"**Market:** {market.get('title') or market.get('question') or 'N/A'}")
     st.write(f"**Category:** {event.get('category') or 'N/A'}")
-    st.write(f"**Volume:** {market.get('volume') or 'N/A'}")
-    st.write(f"**Liquidity:** {market.get('liquidity') or 'N/A'}")
+    st.write(f"**Volume:** {_format_compact_number(market.get('volume'))}")
+    st.write(f"**Liquidity:** {_format_compact_number(market.get('liquidity'))}")
+    polymarket_url = _polymarket_event_url(event)
+    if polymarket_url:
+        st.markdown(f"[Open on Polymarket]({polymarket_url})")
 
 
 def _render_spike_details(
@@ -123,6 +155,56 @@ def _render_spike_history(recent_spikes: list[dict[str, Any]]) -> None:
                 for spike in recent_spikes
             ]
             st.dataframe(history_rows, use_container_width=True, hide_index=True)
+
+
+def _render_cross_asset_predictions(rows: list[dict[str, Any]], error: str | None) -> None:
+    st.markdown("**Cross-Asset Consequence Alerts**")
+    if error:
+        st.warning(f"Cross-asset predictions unavailable: {error}")
+        return
+    if not rows:
+        st.info(
+            "No cross-asset consequence alert is shown because this event likely has limited "
+            "direct impact on tradable assets, or the AI validation gates filtered weak/non-specific signals."
+        )
+        return
+
+    view_rows = [
+        {
+            "asset": row.get("asset_symbol") or "N/A",
+            "class": row.get("asset_class") or "N/A",
+            "horizon": row.get("horizon_bucket") or "N/A",
+            "direction": str(row.get("predicted_direction") or "N/A").upper(),
+            "magnitude": str(row.get("predicted_magnitude_band") or "N/A").title(),
+            "confidence": _format_percent(row.get("prediction_confidence")),
+            "confidence_raw": row.get("prediction_confidence"),
+            "score": _format_price(row.get("source_score")),
+            "signal_time": row.get("signal_time") or "N/A",
+        }
+        for row in rows[:15]
+    ]
+    df = pd.DataFrame(view_rows)
+
+    def _confidence_style(value: Any) -> str:
+        try:
+            pct = float(value)
+        except (TypeError, ValueError):
+            return ""
+        if pct < 0.50:
+            return "color: #d62728; font-weight: 600;"
+        if pct < 0.65:
+            return "color: #ff7f0e; font-weight: 600;"
+        return "color: #2ca02c; font-weight: 600;"
+
+    styled = (
+        df.drop(columns=["confidence_raw"])
+        .style.apply(
+            lambda _: [_confidence_style(val) for val in df["confidence_raw"]],
+            subset=["confidence"],
+            axis=0,
+        )
+    )
+    st.dataframe(styled, use_container_width=True, hide_index=True)
 
 
 def _render_event_card(
@@ -168,10 +250,14 @@ def _render_event_card(
             title=spike_title,
             spikes_error=dashboard["spikes_error"],
         )
+        _render_cross_asset_predictions(
+            dashboard.get("cross_asset_predictions") or [],
+            dashboard.get("cross_asset_error"),
+        )
         _render_spike_history(dashboard["recent_spikes"])
 
 
-st.set_page_config(page_title="Polymarket Whale Tracker", page_icon="PM", layout="wide")
+st.set_page_config(page_title="Polymarket Whale Tracker", page_icon="🐳", layout="wide")
 st.title("Polymarket Whale Tracker")
 st.caption("Live public-data anomaly feed with the newest event pinned at the top.")
 

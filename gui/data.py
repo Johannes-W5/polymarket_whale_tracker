@@ -14,6 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from database.events import get_events as get_db_events
 from database.events import get_event as get_db_event
 from database.events import get_latest_assessment_for_event
+from database.events import get_latest_cross_asset_predictions_for_event
 from database.events import get_latest_whale_spikes
 from database.events import get_recent_whale_spikes
 from model.event_prices import DEFAULT_BASE_URL, get_event_prices
@@ -55,6 +56,14 @@ def _sort_spikes_desc(spikes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(
         spikes,
         key=lambda spike: str(spike.get("to_ts") or ""),
+        reverse=True,
+    )
+
+
+def _sort_predictions_desc(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        rows,
+        key=lambda row: (str(row.get("signal_time") or ""), float(row.get("prediction_confidence") or 0.0)),
         reverse=True,
     )
 
@@ -290,6 +299,18 @@ def load_dashboard_data(
     except Exception as exc:
         prices_error = str(exc)
 
+    cross_asset_predictions: list[dict[str, Any]] = []
+    cross_asset_error: str | None = None
+    try:
+        cross_asset_predictions = _sort_predictions_desc(
+            [
+                _json_safe(dict(row))
+                for row in (get_latest_cross_asset_predictions_for_event(selected_event_id, limit=30) or [])
+            ]
+        )
+    except Exception as exc:
+        cross_asset_error = str(exc)
+
     return {
         "event_id": selected_event_id,
         "event": _json_safe(event),
@@ -302,4 +323,6 @@ def load_dashboard_data(
         "latest_spike": latest_spike,
         "recent_spikes": recent_spikes,
         "spikes_error": spikes_error,
+        "cross_asset_predictions": cross_asset_predictions,
+        "cross_asset_error": cross_asset_error,
     }

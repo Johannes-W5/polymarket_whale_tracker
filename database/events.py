@@ -211,6 +211,48 @@ def _ensure_insider_assessments_table(cur) -> None:
     cur.execute("ALTER TABLE insider_assessments ALTER COLUMN short_summary DROP NOT NULL;")
 
 
+def _ensure_cross_asset_predictions_table(cur) -> None:
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS cross_asset_predictions (
+          id BIGSERIAL PRIMARY KEY,
+          assessment_id BIGINT NULL,
+          event_id TEXT NOT NULL,
+          spike_id TEXT NULL,
+          asset_symbol TEXT NOT NULL,
+          asset_class TEXT NOT NULL,
+          horizon_bucket TEXT NOT NULL,
+          predicted_direction TEXT NOT NULL,
+          predicted_magnitude_band TEXT NOT NULL,
+          prediction_confidence DOUBLE PRECISION NOT NULL,
+          rationale_components JSONB NOT NULL,
+          model_version TEXT NOT NULL,
+          source_score DOUBLE PRECISION NULL,
+          source_score_band TEXT NULL,
+          signal_time TIMESTAMPTZ NULL,
+          metadata JSONB NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """
+    )
+    cur.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_cross_asset_predictions_identity
+        ON cross_asset_predictions (
+          COALESCE(assessment_id, -1),
+          event_id,
+          COALESCE(spike_id, ''),
+          asset_symbol,
+          horizon_bucket,
+          model_version
+        );
+        """
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS ix_cross_asset_predictions_event_created ON cross_asset_predictions (event_id, created_at DESC);"
+    )
+
+
 def insert_insider_assessment(
     *,
     event_id: str,
@@ -219,7 +261,7 @@ def insert_insider_assessment(
     assessment=None,
     market_id: str | None = None,
     trigger_payload: dict[str, Any] | None = None,
-):
+) -> int | None:
     with closing(get_connection()) as conn, conn.cursor() as cur:
         _ensure_insider_assessments_table(cur)
         _ensure_market_reference(
@@ -255,7 +297,8 @@ def insert_insider_assessment(
               prompt_hash,
               trigger_payload
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s::jsonb);
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            RETURNING id;
             """,
             (
                 str(event_id),
@@ -288,8 +331,161 @@ def insert_insider_assessment(
                 json.dumps(trigger_payload) if trigger_payload is not None else None,
             ),
         )
+        inserted = cur.fetchone()
+        conn.commit()
+        if isinstance(inserted, Mapping) and inserted.get("id") is not None:
+            return int(inserted["id"])
+        return None
+
+
+
+def insert_cross_asset_prediction(
+    *,
+    assessment_id: int | None,
+    event_id: str,
+    spike_id: str | None,
+    asset_symbol: str,
+    asset_class: str,
+    horizon_bucket: str,
+    predicted_direction: str,
+    predicted_magnitude_band: str,
+    prediction_confidence: float,
+    rationale_components: list[dict[str, Any]] | dict[str, Any],
+    model_version: str,
+    source_score: float | None = None,
+    source_score_band: str | None = None,
+    signal_time: datetime | None = None,
+    metadata: dict[str, Any] | None = None,
+):
+    with closing(get_connection()) as conn, conn.cursor() as cur:
+        _ensure_cross_asset_predictions_table(cur)
+        cur.execute(
+            """
+            INSERT INTO cross_asset_predictions (
+              assessment_id,
+              event_id,
+              spike_id,
+              asset_symbol,
+              asset_class,
+              horizon_bucket,
+              predicted_direction,
+              predicted_magnitude_band,
+              prediction_confidence,
+              rationale_components,
+              model_version,
+              source_score,
+              source_score_band,
+              signal_time,
+              metadata
+            )
+            SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s::jsonb
+            WHERE NOT EXISTS (
+              SELECT 1
+              FROM cross_asset_predictions cap
+              WHERE cap.assessment_id IS NOT DISTINCT FROM %s
+                AND cap.event_id = %s
+                AND cap.spike_id IS NOT DISTINCT FROM %s
+                AND cap.asset_symbol = %s
+                AND cap.horizon_bucket = %s
+                AND cap.model_version = %s
+            );
+            """,
+            (
+                assessment_id,
+                str(event_id),
+                spike_id,
+                str(asset_symbol).upper(),
+                str(asset_class).lower(),
+                str(horizon_bucket).lower(),
+                str(predicted_direction).lower(),
+                str(predicted_magnitude_band).lower(),
+                float(max(0.0, min(1.0, prediction_confidence))),
+                json.dumps(rationale_components),
+                str(model_version),
+                source_score,
+                source_score_band,
+                signal_time,
+                json.dumps(metadata) if metadata is not None else None,
+                assessment_id,
+                str(event_id),
+                spike_id,
+                str(asset_symbol).upper(),
+                str(horizon_bucket).lower(),
+                str(model_version),
+            ),
+        )
         conn.commit()
 
+
+def get_latest_cross_asset_predictions_for_event(event_id: str, limit: int = 20):
+    with closing(get_connection()) as conn, conn.cursor() as cur:
+        _ensure_cross_asset_predictions_table(cur)
+        cur.execute(
+            """
+            SELECT
+              id,
+              assessment_id,
+              event_id,
+              spike_id,
+              asset_symbol,
+              asset_class,
+              horizon_bucket,
+              predicted_direction,
+              predicted_magnitude_band,
+              prediction_confidence,
+              rationale_components,
+              model_version,
+              source_score,
+              source_score_band,
+              signal_time,
+              metadata,
+              created_at
+            FROM cross_asset_predictions
+            WHERE event_id = %s
+            ORDER BY created_at DESC
+            LIMIT %s;
+            """,
+            (event_id, max(1, min(int(limit), 250))),
+        )
+        return cur.fetchall()
+
+
+def get_high_score_assessments(
+    *,
+    min_score: float = 70.0,
+    since_id: int | None = None,
+    limit: int = 500,
+):
+    with closing(get_connection()) as conn, conn.cursor() as cur:
+        _ensure_insider_assessments_table(cur)
+        params: list[Any] = [float(min_score)]
+        where = ["deterministic_score >= %s", "trigger_payload IS NOT NULL"]
+        if since_id is not None:
+            where.append("id > %s")
+            params.append(int(since_id))
+        params.append(max(1, min(int(limit), 5000)))
+        cur.execute(
+            f"""
+            SELECT
+              id,
+              event_id,
+              trigger_type,
+              spike_id,
+              side,
+              signal_time,
+              deterministic_score,
+              deterministic_score_band,
+              deterministic_feature_snapshot,
+              trigger_payload,
+              created_at
+            FROM insider_assessments
+            WHERE {" AND ".join(where)}
+            ORDER BY id ASC
+            LIMIT %s;
+            """,
+            tuple(params),
+        )
+        return cur.fetchall()
 
 
 def update_market_volume(market_id: str, volume: float):

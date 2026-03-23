@@ -125,17 +125,7 @@ def score_anomaly(inputs: AnomalyScoreInputs) -> DeterministicAnomalyScore:
             )
         )
     )
-    should_call_llm = (
-        score >= 72.0
-        or (
-            score >= 58.0
-            and (
-                pre_news
-                or oi_component >= 0.50
-                or repeated_anomaly
-            )
-        )
-    )
+    should_call_llm = score >= 40.0
 
     trigger_type = "deterministic_anomaly"
     llm_gate_reason = "score_below_llm_gate"

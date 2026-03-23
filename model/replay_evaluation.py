@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .insider_model import assess_insider_probability_from_payload
+from .event_study import summarize_prediction_accuracy
 
 REQUIRED_FIELDS = (
     "spike_id",
@@ -186,6 +187,15 @@ if __name__ == "__main__":
         default=0.1,
         help="Sampling temperature for replayed explanation runs.",
     )
+    parser.add_argument(
+        "--prediction-eval-input",
+        default=None,
+        help=(
+            "Optional JSONL file with cross-asset prediction outcomes. "
+            "Expected fields include predicted_direction, horizon_bucket, "
+            "prediction_confidence, and realized_return."
+        ),
+    )
     args = parser.parse_args()
 
     rows = load_records(args.input, limit=args.limit)
@@ -202,3 +212,8 @@ if __name__ == "__main__":
         if args.output:
             _write_jsonl(args.output, replayed)
             print(f"Wrote replay output to {args.output}")
+
+    if args.prediction_eval_input:
+        prediction_rows = load_records(args.prediction_eval_input, limit=args.limit)
+        evaluation = summarize_prediction_accuracy(prediction_rows)
+        print(json.dumps({"prediction_evaluation": evaluation}, indent=2, sort_keys=True))

@@ -21,7 +21,12 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 
 import httpx
 
-from database.events import insert_insider_assessment, insert_whale_spike
+from database.events import (
+    get_event,
+    insert_cross_asset_prediction,
+    insert_insider_assessment,
+    insert_whale_spike,
+)
 
 try:
     from openai import RateLimitError as OpenAIRateLimitError
@@ -94,6 +99,11 @@ except ImportError:  # pragma: no cover
         fetch_primary_market_metadata,
         find_nearest_news_for_event,
     )
+
+try:  # pragma: no cover - import fallback
+    from .cross_asset_predictions import build_predictions_for_assessment  # type: ignore[relative-beyond-top-level]
+except ImportError:  # pragma: no cover
+    from model.cross_asset_predictions import build_predictions_for_assessment
 
 
 @dataclass
@@ -736,6 +746,51 @@ def monitor_event_and_assess_insider(
         print(f"[whale-tracking] Skipping inactive event {event_id}.", flush=True)
         return
 
+    def _emit_cross_asset_predictions(
+        *,
+        assessment_id: int | None,
+        trigger_payload: dict[str, Any],
+        trigger_type: str,
+        spike: WhaleSpike,
+    ) -> None:
+        assessment_row = {
+            "id": assessment_id,
+            "event_id": event_id,
+            "trigger_type": trigger_type,
+            "spike_id": spike.spike_id,
+            "side": spike.side,
+            "signal_time": spike.signal_time,
+            "deterministic_score": spike.deterministic_score,
+            "deterministic_score_band": spike.deterministic_score_band,
+            "trigger_payload": trigger_payload,
+        }
+        try:
+            event_row = dict(get_event(event_id) or {})
+            try:
+                base = base_url.rstrip("/")
+                with httpx.Client(timeout=request_timeout) as client:
+                    response = client.get(f"{base}/events/{event_id}")
+                    response.raise_for_status()
+                    payload = response.json()
+                if isinstance(payload, dict):
+                    merged = dict(event_row)
+                    merged.update(payload)
+                    event_row = merged
+            except Exception:
+                # DB snapshot is still good enough if API enrichment is unavailable.
+                pass
+            predictions = build_predictions_for_assessment(
+                assessment_row,
+                event_row=event_row,
+            )
+            for prediction in predictions:
+                insert_cross_asset_prediction(**prediction)
+        except Exception as exc:
+            print(
+                f"[whale-tracking] Failed to persist cross-asset predictions for event {event_id}: {exc}",
+                flush=True,
+            )
+
     for spike in monitor_event_for_spikes(
         event_id,
         base_url=base_url,
@@ -812,13 +867,19 @@ def monitor_event_and_assess_insider(
         )
 
         try:
-            insert_insider_assessment(
+            assessment_id = insert_insider_assessment(
                 event_id=event_id,
                 trigger_type=trigger_type,
                 spike=spike,
                 assessment=assessment,
                 market_id=spike.market_id,
                 trigger_payload=trigger_payload,
+            )
+            _emit_cross_asset_predictions(
+                assessment_id=assessment_id,
+                trigger_payload=trigger_payload,
+                trigger_type=trigger_type,
+                spike=spike,
             )
         except Exception as exc:
             print(f"[whale-tracking] Failed to persist trigger for event {event_id}: {exc}", flush=True)

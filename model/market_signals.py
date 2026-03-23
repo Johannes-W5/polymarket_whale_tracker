@@ -385,10 +385,8 @@ def _fetch_order_book(
     with httpx.Client(timeout=timeout) as client:
         r = client.get(f"{base}/book", params={"token_id": token_id})
         if r.status_code in (400, 404):
-            print(
-                f"[market-signals] No usable order book for token {token_id}: {r.status_code}",
-                flush=True,
-            )
+            # Some tokens legitimately have no active CLOB book. Treat as a
+            # normal missing-feature case and continue without noisy logging.
             return {}
         r.raise_for_status()
         data = r.json()

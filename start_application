@@ -16,7 +16,7 @@ python -m model.insider_detection 2890 3100 --interval 5
 
 # monitor ALL active events from the database cache
 # defaults become stricter with --all-events: min_abs=0.05, min_rel=0.10
-python -m model.insider_detection --all-events --max-events 1000 (--all-events calls database/events.py with get_all_event_ids())
+python -m model.insider_detection --all-events --max-events 500 (--all-events calls database/events.py with get_all_event_ids())
 
 # keep the news dataset fresh every 5 minutes
 python -m news_scraper.main --loop --interval-seconds 300
@@ -24,6 +24,7 @@ python -m news_scraper.main --loop --interval-seconds 300
 # validate or replay frozen trigger payloads from a JSONL export
 python -m model.replay_evaluation --input path/to/triggers.jsonl
 
+python3 -m model.cross_asset_predictions --min-score 70 --limit 500
 
 source .venv/bin/activate
 streamlit run gui/app.py # set OLLAMA_API_KEY / OLLAMA_MODEL in the shell if using the explanation layer
