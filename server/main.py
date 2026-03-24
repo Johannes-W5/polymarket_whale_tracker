@@ -62,7 +62,7 @@ def _gamma_events_params(request: Request) -> dict[str, Any]:
     if "closed" not in params:
         params["closed"] = "false"
     if "limit" not in params:
-        params["limit"] = "100"
+        params["limit"] = "500"
     return params
 
 

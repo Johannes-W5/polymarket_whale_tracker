@@ -48,14 +48,14 @@ The proxy forwards list requests to Gamma’s `GET /events`. That upstream endpo
 
 - `active=true`
 - `closed=false`
-- `limit=100`
+- `limit=500`
 
 If you pass `active`, `closed`, or `limit` yourself, those values are sent to Gamma as-is (only missing keys get defaults).
 
 **Debug / raw Gamma behavior:** append `raw=1` (or `raw=true`) to skip default injection and forward the remaining query params only. The `raw` parameter is **not** sent to Gamma.
 
 **Recommended** for “live” listings (explicit, matches cache semantics):  
-`GET /events?active=true&closed=false&limit=100` (adjust `offset` / `limit` for pagination).
+`GET /events?active=true&closed=false&limit=500` (adjust `offset` / `limit` for pagination).
 
 Other examples:
 

@@ -72,7 +72,7 @@ bash scripts/render_smoke_check.sh
 
 Also check:
 
-- **`GET /events`** on the proxy defaults to `active=true`, `closed=false`, and `limit=100` so a bare URL does not mirror Gamma’s unfiltered default (often old closed markets). Use `?raw=1` only if you need upstream’s default ordering. See [`server/README.md`](server/README.md).
+- **`GET /events`** on the proxy defaults to `active=true`, `closed=false`, and `limit=500` so a bare URL does not mirror Gamma’s unfiltered default (often old closed markets). Use `?raw=1` only if you need upstream’s default ordering. See [`server/README.md`](server/README.md).
 - Proxy docs at `https://polymarket-proxy-1rz8.onrender.com/docs`
 - GUI at `https://whaletracker-gui.onrender.com/`
 - GUI loads and can fetch recent data without backend worker services
