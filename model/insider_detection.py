@@ -1017,7 +1017,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--news-path",
-        default="news_scraper/data/news_events.jsonl",
+        default=os.getenv("NEWS_EVENTS_PATH", "news_scraper/data/news_events.jsonl"),
         help="Path to JSONL news dataset used for pre-news informed-flow checks.",
     )
     parser.add_argument(

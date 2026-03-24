@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 import sys
 from typing import Any
@@ -15,6 +15,7 @@ from database.events import get_events as get_db_events
 from database.events import get_event as get_db_event
 from database.events import get_latest_assessment_for_event
 from database.events import get_latest_cross_asset_predictions_for_event
+from database.events import get_daily_top_probability_spikes
 from database.events import get_latest_whale_spikes
 from database.events import get_recent_whale_spikes
 from model.event_prices import DEFAULT_BASE_URL, get_event_prices
@@ -190,6 +191,28 @@ def get_recent_spike_feed(limit: int = 25) -> list[dict[str, Any]]:
         )
 
     return feed
+
+
+def get_daily_top_signal_feed(limit: int = 50) -> list[dict[str, Any]]:
+    now_utc = datetime.now(timezone.utc)
+    day_start = datetime(
+        year=now_utc.year,
+        month=now_utc.month,
+        day=now_utc.day,
+        tzinfo=timezone.utc,
+    )
+    day_end = day_start + timedelta(days=1)
+
+    try:
+        rows = get_daily_top_probability_spikes(
+            day_start=day_start,
+            day_end=day_end,
+            limit=limit,
+        ) or []
+    except Exception:
+        return []
+
+    return [_json_safe(dict(row)) for row in rows]
 
 
 def list_event_options(limit: int = 200) -> list[dict[str, str]]:

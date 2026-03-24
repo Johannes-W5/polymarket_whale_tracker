@@ -246,3 +246,9 @@ async def root():
         "clob": ["/price", "/prices", "/book", "/books (POST)", "/prices-history", "/midpoint", "/spread"],
         "data": ["/positions", "/closed-positions", "/activity", "/value", "/oi", "/holders", "/trades"],
     }
+
+
+@app.get("/health", tags=["Meta"])
+async def health():
+    """Lightweight readiness check for load balancers (e.g. Render)."""
+    return {"status": "ok"}

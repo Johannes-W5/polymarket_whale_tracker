@@ -12,7 +12,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from gui.data import get_default_event_id, get_recent_spike_feed, load_dashboard_data
+from gui.data import (
+    get_daily_top_signal_feed,
+    get_default_event_id,
+    get_recent_spike_feed,
+    load_dashboard_data,
+)
 from model.event_prices import DEFAULT_BASE_URL
 
 
@@ -70,6 +75,11 @@ def _cached_recent_spike_feed(limit: int) -> list[dict[str, Any]]:
 @st.cache_data(ttl=5, show_spinner=False)
 def _cached_dashboard_data(event_id: str, base_url: str, news_path: str) -> dict[str, Any]:
     return load_dashboard_data(event_id, base_url=base_url, news_path=news_path)
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def _cached_daily_top_signals(limit: int) -> list[dict[str, Any]]:
+    return get_daily_top_signal_feed(limit=limit)
 
 
 def _render_spike_metrics(spike: dict[str, Any]) -> None:
@@ -257,9 +267,98 @@ def _render_event_card(
         _render_spike_history(dashboard["recent_spikes"])
 
 
+def _render_daily_top_signals_tab(feed_limit: int, *, base_url: str, news_path: str) -> None:
+    st.subheader("Daily Top Research Signals")
+    today_utc = pd.Timestamp.utcnow().strftime("%Y-%m-%d")
+    st.caption(f"Ranking day: {today_utc} (UTC)")
+
+    with st.spinner("Loading daily top signals..."):
+        rows = _cached_daily_top_signals(feed_limit)
+
+    if not rows:
+        st.info("No assessed spikes with research signal probability have been stored yet for today (UTC).")
+        return
+
+    view_rows = [
+        {
+            "event_id": str(row.get("event_id") or "N/A"),
+            "event": f"{str(row.get('event_name') or row.get('event_id') or 'N/A')} ({str(row.get('event_id') or 'N/A')})",
+            "signal_time": row.get("signal_time") or "N/A",
+            "research_signal_probability": _format_percent(row.get("probability_insider")),
+            "probability_raw": row.get("probability_insider"),
+            "explanation_confidence": str(row.get("confidence") or "N/A").title(),
+            "deterministic_score": _format_price(row.get("deterministic_score")),
+            "score_band": str(row.get("deterministic_score_band") or "N/A").title(),
+            "side": str(row.get("side") or "N/A"),
+            "price_move": _format_percent(row.get("rel_change")),
+            "summary": row.get("short_summary") or "",
+        }
+        for row in rows
+    ]
+    df = pd.DataFrame(view_rows)
+
+    display_df = df.drop(columns=["probability_raw", "event_id"])
+    selection = st.dataframe(
+        display_df,
+        use_container_width=True,
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key="daily_top_signal_table",
+    )
+    st.caption("Click a row to open the full event dashboard below.")
+
+    selected_rows: list[int] = []
+    try:
+        selected_rows = list(selection.selection.rows)  # Streamlit dataframe state
+    except Exception:
+        selected_rows = []
+    if not selected_rows:
+        return
+
+    selected_idx = selected_rows[0]
+    if selected_idx < 0 or selected_idx >= len(view_rows):
+        return
+    selected_event_id = str(view_rows[selected_idx].get("event_id") or "").strip()
+    if not selected_event_id:
+        return
+
+    try:
+        selected_dashboard = _cached_dashboard_data(selected_event_id, base_url, news_path)
+    except Exception as exc:
+        st.error(f"Failed to load selected event details for {selected_event_id}: {exc}")
+        return
+
+    st.markdown("### Selected Event Full View")
+    _render_event_card(
+        selected_dashboard,
+        label_prefix="Selected Event",
+        expanded=True,
+        spike_title="Latest Spike Details",
+    )
+
+
 st.set_page_config(page_title="Polymarket Whale Tracker", page_icon="🐳", layout="wide")
 st.title("Polymarket Whale Tracker")
 st.caption("Live public-data anomaly feed with the newest event pinned at the top.")
+st.markdown(
+    """
+    <style>
+    div[role="tablist"] > button[role="tab"] {
+        font-size: 1.35rem !important;
+        font-weight: 800 !important;
+        padding-top: 0.9rem !important;
+        padding-bottom: 0.9rem !important;
+        min-height: 3.2rem !important;
+    }
+    div[role="tablist"] > button[role="tab"] p {
+        font-size: 1.35rem !important;
+        font-weight: 800 !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 default_base_url = os.getenv("POLYMARKET_API_BASE", DEFAULT_BASE_URL)
 default_news_path = os.getenv("NEWS_EVENTS_PATH", "news_scraper/data/news_events.jsonl")
@@ -279,7 +378,7 @@ with st.sidebar:
 
 
 @st.fragment(run_every=refresh_seconds)
-def _render_live_dashboard() -> None:
+def _render_live_dashboard_tab() -> None:
     with st.spinner("Loading live spike feed..."):
         recent_feed = _cached_recent_spike_feed(feed_limit)
 
@@ -329,4 +428,14 @@ def _render_live_dashboard() -> None:
         )
 
 
-_render_live_dashboard()
+live_tab, daily_tab = st.tabs(["Live Feed", "Daily Top Signals"])
+
+with live_tab:
+    _render_live_dashboard_tab()
+
+with daily_tab:
+    _render_daily_top_signals_tab(
+        feed_limit=max(20, feed_limit),
+        base_url=base_url,
+        news_path=news_path,
+    )

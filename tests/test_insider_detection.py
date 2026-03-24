@@ -55,7 +55,8 @@ def test_score_anomaly_high_signal_pre_news_calls_llm() -> None:
     assert result.deterministic_score_band in {"high", "severe"}
 
 
-def test_score_anomaly_moderate_signal_can_emit_without_llm() -> None:
+def test_score_anomaly_moderate_signal_emits_and_passes_llm_gate() -> None:
+    """Score >= 40 both emits (via flow confirmation) and passes the LLM gate."""
     result = score_anomaly(
         AnomalyScoreInputs(
             price_move_abs=0.035,
@@ -73,7 +74,7 @@ def test_score_anomaly_moderate_signal_can_emit_without_llm() -> None:
         )
     )
     assert result.should_emit is True
-    assert result.should_call_llm is False
+    assert result.should_call_llm is True
     assert result.deterministic_score_band in {"elevated", "high"}
 
 

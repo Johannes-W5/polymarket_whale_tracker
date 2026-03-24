@@ -8,13 +8,14 @@ GET /prices with both tokens in one request.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
 
-DEFAULT_BASE_URL = "http://127.0.0.1:8000"
+DEFAULT_BASE_URL = os.getenv("POLYMARKET_API_BASE", "http://127.0.0.1:8000").rstrip("/")
 
 
 @dataclass

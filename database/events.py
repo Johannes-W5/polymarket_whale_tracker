@@ -591,3 +591,44 @@ def get_latest_assessment_for_event(event_id: str):
             (event_id,),
         )
         return cur.fetchone()
+
+
+def get_daily_top_probability_spikes(
+    *,
+    day_start: datetime,
+    day_end: datetime,
+    limit: int = 50,
+):
+    with closing(get_connection()) as conn, conn.cursor() as cur:
+        _ensure_insider_assessments_table(cur)
+        cur.execute(
+            """
+            SELECT
+              ia.id,
+              ia.event_id,
+              e.name AS event_name,
+              ia.trigger_type,
+              ia.spike_id,
+              ia.side,
+              ia.signal_time,
+              ia.from_price,
+              ia.to_price,
+              ia.abs_change,
+              ia.rel_change,
+              ia.deterministic_score,
+              ia.deterministic_score_band,
+              ia.probability_insider,
+              ia.confidence,
+              ia.short_summary,
+              ia.created_at
+            FROM insider_assessments ia
+            LEFT JOIN events e ON e.id = ia.event_id
+            WHERE ia.probability_insider IS NOT NULL
+              AND ia.signal_time >= %s
+              AND ia.signal_time < %s
+            ORDER BY ia.probability_insider DESC, ia.signal_time DESC
+            LIMIT %s;
+            """,
+            (day_start, day_end, max(1, min(int(limit), 500))),
+        )
+        return cur.fetchall()

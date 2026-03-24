@@ -1,0 +1,130 @@
+# Render Blueprint: https://render.com/docs/blueprint-spec
+# After first deploy, set POLYMARKET_API_BASE on worker/cron/streamlit to your
+# polymarket-proxy public URL (https://<name>.onrender.com).
+
+databases:
+  - name: whaletracker-db
+    databaseName: whaletracker
+    user: whaletracker
+
+services:
+  # FastAPI proxy — run from server/ so `from config import ...` resolves.
+  - type: web
+    name: polymarket-proxy
+    runtime: python
+    region: oregon
+    plan: starter
+    rootDir: server
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.0"
+
+  # Streamlit dashboard
+  - type: web
+    name: whaletracker-gui
+    runtime: python
+    region: oregon
+    plan: starter
+    rootDir: .
+    buildCommand: pip install -r news_scraper/requirements.txt && pip install -r server/requirements.txt && pip install -r gui/requirements.txt
+    startCommand: streamlit run gui/app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true
+    healthCheckPath: /_stcore/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.0"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: whaletracker-db
+          property: connectionString
+      - key: POLYMARKET_API_BASE
+        sync: false
+      - key: OLLAMA_API_KEY
+        sync: false
+      - key: OLLAMA_HOST
+        value: https://ollama.com
+      - key: OLLAMA_MODEL
+        value: qwen3.5:cloud
+
+  # News scraper + insider detection share one disk (JSONL is not visible across separate workers).
+  - type: worker
+    name: whaletracker-pipeline
+    runtime: python
+    region: oregon
+    plan: starter
+    rootDir: .
+    buildCommand: pip install -r news_scraper/requirements.txt && pip install -r server/requirements.txt && pip install -r model/requirements.txt
+    startCommand: bash scripts/render_start_pipeline_worker.sh
+    disk:
+      name: news-data
+      mountPath: /var/news-data
+      sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.0"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: whaletracker-db
+          property: connectionString
+      - key: NEWS_EVENTS_PATH
+        value: /var/news-data/news_events.jsonl
+      - key: NEWS_EVENTS_METADATA_PATH
+        value: /var/news-data/news_events.metadata.json
+      - key: NEWS_SCRAPER_INTERVAL_SECONDS
+        value: "300"
+      - key: POLYMARKET_API_BASE
+        sync: false
+      - key: OLLAMA_API_KEY
+        sync: false
+      - key: OLLAMA_HOST
+        value: https://ollama.com
+      - key: OLLAMA_MODEL
+        value: qwen3.5:cloud
+      - key: X_BEARER_TOKEN
+        sync: false
+
+  - type: cron
+    name: whaletracker-event-cache
+    runtime: python
+    region: oregon
+    plan: starter
+    schedule: "*/15 * * * *"
+    rootDir: .
+    buildCommand: pip install -r server/requirements.txt && pip install -r model/requirements.txt
+    startCommand: python -m model.event_cache
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.0"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: whaletracker-db
+          property: connectionString
+      - key: POLYMARKET_API_BASE
+        sync: false
+
+  - type: cron
+    name: whaletracker-cross-asset
+    runtime: python
+    region: oregon
+    plan: starter
+    schedule: "*/30 * * * *"
+    rootDir: .
+    buildCommand: pip install -r server/requirements.txt && pip install -r news_scraper/requirements.txt && pip install -r model/requirements.txt
+    startCommand: python -m model.cross_asset_predictions --min-score 70 --limit 500
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.0"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: whaletracker-db
+          property: connectionString
+      - key: POLYMARKET_API_BASE
+        sync: false
+      - key: OLLAMA_API_KEY
+        sync: false
+      - key: OLLAMA_HOST
+        value: https://ollama.com
+      - key: OLLAMA_MODEL
+        value: qwen3.5:cloud
