@@ -74,28 +74,33 @@ def get_event(event_id: str):
         return cur.fetchone()
 
 
-def insert_event(event):
+def _upsert_event_row(cur, event: Any) -> None:
+    """Upsert one event using an existing cursor (caller commits)."""
     normalized = _normalize_event_for_db(event)
+    cur.execute(
+        """
+        INSERT INTO events (id, name, description, created_at, active)
+        VALUES (%s,%s,%s,%s,%s)
+        ON CONFLICT (id) DO UPDATE
+        SET
+          name = EXCLUDED.name,
+          description = EXCLUDED.description,
+          created_at = EXCLUDED.created_at,
+          active = EXCLUDED.active;
+        """,
+        (
+            normalized.id,
+            normalized.name,
+            normalized.description,
+            normalized.created_at,
+            normalized.active,
+        ),
+    )
+
+
+def insert_event(event):
     with closing(get_connection()) as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO events (id, name, description, created_at, active)
-            VALUES (%s,%s,%s,%s,%s)
-            ON CONFLICT (id) DO UPDATE
-            SET
-              name = EXCLUDED.name,
-              description = EXCLUDED.description,
-              created_at = EXCLUDED.created_at,
-              active = EXCLUDED.active;
-            """,
-            (
-                normalized.id,
-                normalized.name,
-                normalized.description,
-                normalized.created_at,
-                normalized.active,
-            ),
-        )
+        _upsert_event_row(cur, event)
         conn.commit()
 
 

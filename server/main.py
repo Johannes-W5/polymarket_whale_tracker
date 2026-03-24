@@ -45,6 +45,27 @@ def _query_params(request: Request) -> dict[str, Any]:
     return {k: v for k, v in request.query_params.items()}
 
 
+def _gamma_events_params(request: Request) -> dict[str, Any]:
+    """
+    Build query string for Gamma GET /events.
+
+    Bare /events (no query) on upstream Gamma returns an unhelpful default slice
+    (often old resolved markets). Match model.event_cache filters unless the client
+    opts out with raw=1 (pass-through to Gamma, raw stripped).
+    """
+    params = dict(_query_params(request))
+    raw_val = str(params.pop("raw", "")).lower()
+    if raw_val in ("1", "true", "yes"):
+        return params
+    if "active" not in params:
+        params["active"] = "true"
+    if "closed" not in params:
+        params["closed"] = "false"
+    if "limit" not in params:
+        params["limit"] = "100"
+    return params
+
+
 async def _proxy_get(
     request: Request,
     base: str,
@@ -69,8 +90,15 @@ async def _proxy_get(
 
 @app.get("/events", tags=["Gamma"])
 async def get_events(request: Request):
-    """List events- with optional filtering and pagination."""
-    return await _proxy_get(request, GAMMA_API, "/events")
+    """List events with optional filtering and pagination (defaults match event_cache)."""
+    params = _gamma_events_params(request)
+    client: httpx.AsyncClient = request.app.state.http
+    r = await client.get(f"{GAMMA_API}/events", params=params)
+    try:
+        content = r.json()
+    except Exception:
+        content = {"detail": r.text}
+    return JSONResponse(status_code=r.status_code, content=content)
 
 
 @app.get("/events/{id}", tags=["Gamma"])

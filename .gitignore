@@ -18,6 +18,7 @@ htmlcov/
 # Local env and secrets
 .env
 .env.local
+.env.remote
 *.pem
 
 # OS / editor

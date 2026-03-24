@@ -91,11 +91,11 @@ def _render_spike_metrics(spike: dict[str, Any]) -> None:
 
 
 def _render_assessment_section(assessment: dict[str, Any] | None, assessment_error: str | None) -> None:
-    st.markdown("**Research Signal Assessment**")
+    st.markdown("**Insider Signal Assessment**")
     if assessment and assessment.get("has_llm_assessment"):
         prob_col, conf_col = st.columns(2)
         prob_col.metric(
-            "Research Signal Probability",
+            "Insider Signal Probability",
             _format_percent(assessment.get("probability_insider")),
         )
         conf_col.metric(
@@ -268,7 +268,7 @@ def _render_event_card(
 
 
 def _render_daily_top_signals_tab(feed_limit: int, *, base_url: str, news_path: str) -> None:
-    st.subheader("Daily Top Research Signals")
+    st.subheader("Daily Top Insider Signals")
     today_utc = pd.Timestamp.utcnow().strftime("%Y-%m-%d")
     st.caption(f"Ranking day: {today_utc} (UTC)")
 
@@ -276,7 +276,7 @@ def _render_daily_top_signals_tab(feed_limit: int, *, base_url: str, news_path: 
         rows = _cached_daily_top_signals(feed_limit)
 
     if not rows:
-        st.info("No assessed spikes with research signal probability have been stored yet for today (UTC).")
+        st.info("No assessed spikes with insider signal probability have been stored yet for today (UTC).")
         return
 
     view_rows = [
@@ -284,7 +284,7 @@ def _render_daily_top_signals_tab(feed_limit: int, *, base_url: str, news_path: 
             "event_id": str(row.get("event_id") or "N/A"),
             "event": f"{str(row.get('event_name') or row.get('event_id') or 'N/A')} ({str(row.get('event_id') or 'N/A')})",
             "signal_time": row.get("signal_time") or "N/A",
-            "research_signal_probability": _format_percent(row.get("probability_insider")),
+            "Insider Signal Probability": _format_percent(row.get("probability_insider")),
             "probability_raw": row.get("probability_insider"),
             "explanation_confidence": str(row.get("confidence") or "N/A").title(),
             "deterministic_score": _format_price(row.get("deterministic_score")),

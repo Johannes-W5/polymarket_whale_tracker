@@ -10,20 +10,13 @@ from typing import Any, Dict, List
 
 import httpx
 
-from database.events import insert_event
 from database.connection import get_connection
+from database.events import _upsert_event_row
 from .event_prices import DEFAULT_BASE_URL
 
 
 def _is_event_active(event: Dict[str, Any]) -> bool:
     return bool(event.get("active")) and not bool(event.get("closed", False))
-
-
-def _reset_all_events_inactive() -> None:
-    """Mark every event in the DB as inactive before a fresh sync."""
-    with closing(get_connection()) as conn, conn.cursor() as cur:
-        cur.execute("UPDATE events SET active = FALSE;")
-        conn.commit()
 
 
 def fetch_events_page(
@@ -34,9 +27,13 @@ def fetch_events_page(
     timeout: float = 30.0,
     retries: int = 3,
     retry_delay: float = 5.0,
-) -> List[Dict[str, Any]]:
+) -> tuple[List[Dict[str, Any]], int]:
     """
     Fetch a page of current active events from the local proxy.
+
+    Returns (filtered_active_events, raw_row_count_from_api).
+    `raw_row_count_from_api` is the Gamma list length before client-side filtering;
+    use it for pagination (not len(filtered), which can be smaller).
 
     Retries up to `retries` times on 5xx errors before giving up.
     """
@@ -55,12 +52,14 @@ def fetch_events_page(
                 r.raise_for_status()
                 payload = r.json()
             if isinstance(payload, list):
-                return [
+                raw_n = len(payload)
+                filtered = [
                     e
                     for e in payload
                     if isinstance(e, dict) and _is_event_active(e)
                 ]
-            return []
+                return filtered, raw_n
+            return [], 0
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code < 500:
                 raise
@@ -101,7 +100,7 @@ def sync_events_to_db(
     """
     total = 0
     try:
-        first_page = fetch_events_page(
+        first_events, first_api_n = fetch_events_page(
             base_url=base_url,
             limit=page_size,
             offset=0,
@@ -110,31 +109,48 @@ def sync_events_to_db(
     except Exception as exc:
         raise RuntimeError(f"initial event-cache fetch failed: {exc}") from exc
 
-    _reset_all_events_inactive()
-    for page in range(max(1, int(max_pages))):
-        offset = page * page_size
-        if page == 0:
-            events = first_page
-        else:
-            try:
-                events = fetch_events_page(
-                    base_url=base_url,
-                    limit=page_size,
-                    offset=offset,
-                    timeout=timeout,
-                )
-            except Exception as exc:
-                print(f"[event-cache] Skipping page at offset={offset}: {exc}")
-                continue
-        if not events:
-            break
-        for event in events:
-            if not _is_event_active(event):
-                continue
-            insert_event(event)
-            total += 1
-        if len(events) < page_size:
-            break
+    # One connection + one commit per API page (not per row) — far fewer Neon round-trips.
+    with closing(get_connection()) as conn, conn.cursor() as cur:
+        cur.execute("UPDATE events SET active = FALSE;")
+        conn.commit()
+
+        for page in range(max(1, int(max_pages))):
+            offset = page * page_size
+            if page == 0:
+                events, api_n = first_events, first_api_n
+            else:
+                try:
+                    events, api_n = fetch_events_page(
+                        base_url=base_url,
+                        limit=page_size,
+                        offset=offset,
+                        timeout=timeout,
+                    )
+                except Exception as exc:
+                    print(f"[event-cache] Skipping page at offset={offset}: {exc}", flush=True)
+                    continue
+
+            if api_n == 0:
+                break
+
+            page_upserts = 0
+            for event in events:
+                if not _is_event_active(event):
+                    continue
+                _upsert_event_row(cur, event)
+                total += 1
+                page_upserts += 1
+
+            conn.commit()
+            print(
+                f"[event-cache] page={page} offset={offset} api_rows={api_n} "
+                f"upserted_active={page_upserts} running_total={total}",
+                flush=True,
+            )
+
+            if api_n < page_size:
+                break
+
     return total
 
 

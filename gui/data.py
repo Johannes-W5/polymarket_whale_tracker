@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
-from pathlib import Path
+import os
 import sys
-from typing import Any
+import time
+from pathlib import Path
+from typing import Any, Callable, TypeVar
 
 import httpx
 
@@ -19,6 +21,36 @@ from database.events import get_daily_top_probability_spikes
 from database.events import get_latest_whale_spikes
 from database.events import get_recent_whale_spikes
 from model.event_prices import DEFAULT_BASE_URL, get_event_prices
+
+T = TypeVar("T")
+
+
+def _proxy_http_timeout() -> float:
+    """Render free-tier cold starts often exceed 10s; overridable via env."""
+    return float(os.getenv("POLYMARKET_HTTP_TIMEOUT", "45"))
+
+
+def _with_proxy_retries(operation: Callable[[], T]) -> T:
+    """
+    Retry on transient proxy / edge failures (common on Render after sleep or under load).
+    """
+    retries = max(1, int(os.getenv("POLYMARKET_HTTP_RETRIES", "3")))
+    base_delay = float(os.getenv("POLYMARKET_HTTP_RETRY_DELAY", "2"))
+    for attempt in range(retries):
+        try:
+            return operation()
+        except httpx.HTTPStatusError as exc:
+            code = exc.response.status_code
+            if code in (502, 503, 504) and attempt < retries - 1:
+                time.sleep(min(base_delay * (2**attempt), 20.0))
+                continue
+            raise
+        except httpx.TransportError:
+            if attempt < retries - 1:
+                time.sleep(min(base_delay * (2**attempt), 20.0))
+                continue
+            raise
+    raise RuntimeError("proxy retry loop exited without return")
 
 
 def _json_safe(value: Any) -> Any:
@@ -299,7 +331,10 @@ def load_dashboard_data(
     market: dict[str, Any] = {}
     event_error: str | None = None
     try:
-        event = _api_get_json(f"/events/{selected_event_id}", base_url=base_url, timeout=10.0)
+        _t = _proxy_http_timeout()
+        event = _with_proxy_retries(
+            lambda: _api_get_json(f"/events/{selected_event_id}", base_url=base_url, timeout=_t)
+        )
         market = _select_primary_market(event) or {}
     except Exception as exc:
         event_error = str(exc)
@@ -312,7 +347,10 @@ def load_dashboard_data(
         "no_token_id": None,
     }
     try:
-        current_prices = get_event_prices(selected_event_id, base_url=base_url, timeout=10.0)
+        _t = _proxy_http_timeout()
+        current_prices = _with_proxy_retries(
+            lambda: get_event_prices(selected_event_id, base_url=base_url, timeout=_t)
+        )
         prices = {
             "yes_price": current_prices.yes_price,
             "no_price": current_prices.no_price,

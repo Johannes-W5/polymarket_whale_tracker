@@ -5,26 +5,112 @@ Research analytics only:
 - no trading, execution, wallet, or account actions
 - outputs are suspicious-activity research signals, not legal determinations
 
-Terminal	Command
+Prerequisite (avoids ModuleNotFoundError: use the venv, not system python3):
+source .venv/bin/activate
+# If .venv is missing: python3 -m venv .venv && .venv/bin/pip install -r server/requirements.txt
+#
+# .env.local: set DATABASE_URL for Neon. If the URL contains &, wrap the whole value in
+# single quotes or bash will background the rest and DATABASE_URL stays unset.
+
+========================
+LOCAL DEVELOPMENT STARTUP
+========================
+
+# terminal 1 (local proxy)
+source .venv/bin/activate
+source scripts/use_env.sh local
 cd server && python -m uvicorn main:app --reload
 
-# start event cache (refreshes current active events used by --all-events)
-python -m model.event_cache 
+# terminal 2a — one-shot jobs (same terminal, order as written)
+# cross_asset_predictions: batch backfill for high-score assessments (needs OLLAMA_API_KEY).
+# insider_detection already inserts cross-asset rows when each assessment is persisted; this
+# module matches the GitHub Actions / Render cron job for anything that was missed.
+source .venv/bin/activate
+source scripts/use_env.sh local
+python -m model.event_cache
+python -m model.cross_asset_predictions --min-score 70 --limit 500
 
-# monitor specific events (defaults: min_abs=0.03, min_rel=0.08)
-python -m model.insider_detection 2890 3100 --interval 5
+# terminal 2b — long-running (separate terminal; blocks until Ctrl+C)
+#set OLLAMA_API_KEY / OLLAMA_MODEL in the shell
+source .venv/bin/activate
+source scripts/use_env.sh local
+python -m model.insider_detection --all-events --max-events 500
 
-# monitor ALL active events from the database cache
-# defaults become stricter with --all-events: min_abs=0.05, min_rel=0.10
-python -m model.insider_detection --all-events --max-events 500 (--all-events calls database/events.py with get_all_event_ids())
+# terminal 3 (dashboard)
+# set OLLAMA_API_KEY / OLLAMA_MODEL in the shell 
+source .venv/bin/activate
+source scripts/use_env.sh local
+streamlit run gui/app.py
 
-# keep the news dataset fresh every 5 minutes
+#terminal 4 (news scraper)
+source .venv/bin/activate
+source scripts/use_env.sh local
 python -m news_scraper.main --loop --interval-seconds 300
 
-# validate or replay frozen trigger payloads from a JSONL export
-python -m model.replay_evaluation --input path/to/triggers.jsonl
+=============================
+REMOTE INTEGRATION STARTUP
+=============================
+# use_env.sh remote loads .env.remote if present; otherwise .env.local or .env.
+# For Neon + deployed proxy, put DATABASE_URL (quoted) and POLYMARKET_API_BASE=https://…onrender.com in that file.
 
-python3 -m model.cross_asset_predictions --min-score 70 --limit 500
-
+# terminal 1 (optional local proxy; remote profile uses deployed proxy URL)
 source .venv/bin/activate
-streamlit run gui/app.py # set OLLAMA_API_KEY / OLLAMA_MODEL in the shell if using the explanation layer
+source scripts/use_env.sh remote
+cd server && python -m uvicorn main:app --reload
+
+# terminal 2a — one-shot jobs (event cache + cross-asset batch; same notes as local)
+source .venv/bin/activate
+source scripts/use_env.sh remote
+python -m model.event_cache
+python -m model.cross_asset_predictions --min-score 70 --limit 500
+
+# terminal 2b — insider_detection (separate terminal; blocks)
+source .venv/bin/activate
+source scripts/use_env.sh remote   # now falls back to .env.local if needed
+python -m model.insider_detection --all-events --max-events 500
+
+# terminal 3 (local UI against remote backend/db)
+source .venv/bin/activate
+source scripts/use_env.sh remote
+streamlit run gui/app.py
+
+# terminal 4 — news scraper loop (separate terminal; blocks)
+source .venv/bin/activate
+source scripts/use_env.sh remote
+python -m news_scraper.main --loop --interval-seconds 300
+
+========================
+NEWS SCRAPER SCHEDULING
+========================
+
+Paths (must match what insider_detection uses: --news-path or NEWS_EVENTS_PATH):
+- Default files: news_scraper/data/news_events.jsonl + .metadata.json
+- Override: export NEWS_EVENTS_PATH=... and NEWS_EVENTS_METADATA_PATH=...
+
+--- Local ---
+
+Option A — long-running loop (extra terminal; good while developing):
+  source .venv/bin/activate
+  source scripts/use_env.sh local   # or remote
+  pip install -r news_scraper/requirements.txt   # once
+  python -m news_scraper.main --loop --interval-seconds 300
+
+Option B — cron / systemd timer (one shot per run; append-only JSONL):
+  */15 * * * * cd /path/to/polymarket_whaletracker && .venv/bin/python -m news_scraper.main
+  (set cwd and use full path to venv python; load env if needed)
+
+--- Remote ---
+
+Option A — GitHub Actions (free-tier friendly; see DEPLOYMENT_RENDER.md):
+  Workflow: .github/workflows/news-scrape.yml
+  Schedule: every 10 minutes (cron: */10 * * * *)
+  Writes to /tmp on the runner (ephemeral). Set secret X_BEARER_TOKEN only if you enable X in news_scraper/config.py.
+  Manual run: Actions → "News Scrape Schedule" → Run workflow.
+
+Option B — Render paid worker (render.yaml service whaletracker-pipeline):
+  scripts/render_start_pipeline_worker.sh runs news loop + insider_detection on disk /var/news-data/.
+
+Notes:
+- specific-events detector defaults: min_abs=0.01, min_rel=0.02
+- --all-events detector defaults: min_abs=0.015, min_rel=0.03
+- replay frozen trigger payloads: python -m model.replay_evaluation --input path/to/triggers.jsonl

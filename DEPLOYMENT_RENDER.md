@@ -26,9 +26,9 @@ This guide focuses on the free-tier setup:
 2. In Render Dashboard, create a Blueprint using `render.free.yaml`.
 3. Set required Render env vars:
    - `DATABASE_URL` on `whaletracker-gui` (and optionally on proxy for future use)
-   - `POLYMARKET_API_BASE` on `whaletracker-gui` to the deployed proxy URL, e.g. `https://polymarket-proxy.onrender.com`
+   - `POLYMARKET_API_BASE` on `whaletracker-gui` to the deployed proxy URL: `https://polymarket-proxy-1rz8.onrender.com`
    - Optional LLM vars: `OLLAMA_API_KEY`, `OLLAMA_HOST`, `OLLAMA_MODEL`
-4. Deploy proxy first; confirm `https://<proxy>/health` works.
+4. Deploy proxy first; confirm `https://polymarket-proxy-1rz8.onrender.com/health` works.
 5. Deploy GUI and verify `/_stcore/health`.
 6. Configure GitHub Secrets for scheduled jobs:
    - `DATABASE_URL`
@@ -66,13 +66,15 @@ Render free web services do not provide a shared persistent disk for this pipeli
 From your machine:
 
 ```bash
-export PROXY_URL=https://<your-polymarket-proxy>.onrender.com
+export PROXY_URL=https://polymarket-proxy-1rz8.onrender.com
 bash scripts/render_smoke_check.sh
 ```
 
 Also check:
 
-- Proxy docs at `https://<proxy>/docs`
+- **`GET /events`** on the proxy defaults to `active=true`, `closed=false`, and `limit=100` so a bare URL does not mirror Gamma’s unfiltered default (often old closed markets). Use `?raw=1` only if you need upstream’s default ordering. See [`server/README.md`](server/README.md).
+- Proxy docs at `https://polymarket-proxy-1rz8.onrender.com/docs`
+- GUI at `https://whaletracker-gui.onrender.com/`
 - GUI loads and can fetch recent data without backend worker services
 
 ## Free-tier caveats

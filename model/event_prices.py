@@ -15,7 +15,10 @@ from typing import Any
 import httpx
 
 
-DEFAULT_BASE_URL = os.getenv("POLYMARKET_API_BASE", "http://127.0.0.1:8000").rstrip("/")
+DEFAULT_BASE_URL = os.getenv(
+    "POLYMARKET_API_BASE",
+    "http://127.0.0.1:8000",
+).rstrip("/")
 
 
 @dataclass

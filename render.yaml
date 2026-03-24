@@ -40,7 +40,7 @@ services:
           name: whaletracker-db
           property: connectionString
       - key: POLYMARKET_API_BASE
-        sync: false
+        value: https://polymarket-proxy-1rz8.onrender.com
       - key: OLLAMA_API_KEY
         sync: false
       - key: OLLAMA_HOST
@@ -75,7 +75,7 @@ services:
       - key: NEWS_SCRAPER_INTERVAL_SECONDS
         value: "300"
       - key: POLYMARKET_API_BASE
-        sync: false
+        value: https://polymarket-proxy-1rz8.onrender.com
       - key: OLLAMA_API_KEY
         sync: false
       - key: OLLAMA_HOST
@@ -102,7 +102,7 @@ services:
           name: whaletracker-db
           property: connectionString
       - key: POLYMARKET_API_BASE
-        sync: false
+        value: https://polymarket-proxy-1rz8.onrender.com
 
   - type: cron
     name: whaletracker-cross-asset
@@ -121,7 +121,7 @@ services:
           name: whaletracker-db
           property: connectionString
       - key: POLYMARKET_API_BASE
-        sync: false
+        value: https://polymarket-proxy-1rz8.onrender.com
       - key: OLLAMA_API_KEY
         sync: false
       - key: OLLAMA_HOST
