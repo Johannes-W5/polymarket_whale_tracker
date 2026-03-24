@@ -1,0 +1,38 @@
+# Free-tier Render blueprint (API + GUI only).
+# Background workers, cron jobs, persistent disks, and Render Postgres are omitted.
+services:
+  - type: web
+    name: polymarket-proxy
+    runtime: python
+    plan: free
+    region: oregon
+    rootDir: server
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.0"
+
+  - type: web
+    name: whaletracker-gui
+    runtime: python
+    plan: free
+    region: oregon
+    rootDir: .
+    buildCommand: pip install -r news_scraper/requirements.txt && pip install -r server/requirements.txt && pip install -r gui/requirements.txt
+    startCommand: streamlit run gui/app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true
+    healthCheckPath: /_stcore/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.0"
+      - key: DATABASE_URL
+        sync: false
+      - key: POLYMARKET_API_BASE
+        sync: false
+      - key: OLLAMA_API_KEY
+        sync: false
+      - key: OLLAMA_HOST
+        value: https://ollama.com
+      - key: OLLAMA_MODEL
+        value: qwen3.5:cloud

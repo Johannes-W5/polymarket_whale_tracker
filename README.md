@@ -9,7 +9,7 @@ See [`start_application`](start_application) for typical commands (API proxy, ev
 ## Deploy on Render
 
 Step-by-step hosting guide: **[DEPLOYMENT_RENDER.md](DEPLOYMENT_RENDER.md)**  
-Infrastructure as code: **[render.yaml](render.yaml)**
+Infrastructure as code: **[render.yaml](render.yaml)** (paid/full) and **[render.free.yaml](render.free.yaml)** (free-tier)
 
 ## Configuration
 

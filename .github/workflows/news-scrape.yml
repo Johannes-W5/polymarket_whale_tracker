@@ -1,0 +1,29 @@
+name: News Scrape Schedule
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/10 * * * *"
+
+jobs:
+  news-scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r news_scraper/requirements.txt
+
+      - name: Run one-shot news scrape
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          NEWS_EVENTS_PATH: /tmp/news_events.jsonl
+          NEWS_EVENTS_METADATA_PATH: /tmp/news_events.metadata.json
+          X_BEARER_TOKEN: ${{ secrets.X_BEARER_TOKEN }}
+        run: python -m news_scraper.main

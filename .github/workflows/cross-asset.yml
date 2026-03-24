@@ -1,0 +1,35 @@
+name: Cross Asset Schedule
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/45 * * * *"
+
+jobs:
+  cross-asset:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r model/requirements.txt
+
+      - name: Run cross-asset batch
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
+          OLLAMA_HOST: ${{ secrets.OLLAMA_HOST }}
+          OLLAMA_MODEL: ${{ secrets.OLLAMA_MODEL }}
+        run: |
+          if [ -z "${OLLAMA_API_KEY}" ]; then
+            echo "Skipping: OLLAMA_API_KEY is not configured."
+            exit 0
+          fi
+          python -m model.cross_asset_predictions --min-score 70 --limit 500
