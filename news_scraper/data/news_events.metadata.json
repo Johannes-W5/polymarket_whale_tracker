@@ -1,17 +1,17 @@
 {
   "dataset_contract_version": "news-dataset-v1",
-  "dataset_sha256": "f3d6e1f35c8cc2d7dcc588a891459c1f6531494111cdfbc666c62f1d46bc8498",
+  "dataset_sha256": "67e0985f460d96e09b8b0032fd4541093f40bb3634242fe1b5731c13dca851b1",
   "output_path": "news_scraper/data/news_events.jsonl",
   "pipeline_version": "public-news-pipeline-v1",
-  "record_count": 795,
+  "record_count": 923,
   "rss": {
     "feed_count": 14,
     "written_records": 0
   },
-  "run_started_at": "2026-03-24T20:09:59.837655Z",
-  "seen_key_count": 795,
+  "run_started_at": "2026-03-25T15:25:15.983493Z",
+  "seen_key_count": 923,
   "source_config_hash": "d3ecdc76b04fd754796eef9dbc5fb6d544f3215e6349bb949ace7a5567e035f2",
-  "updated_at": "2026-03-24T20:10:03.427914Z",
+  "updated_at": "2026-03-25T15:25:18.733667Z",
   "x": {
     "enabled": false,
     "query_count": 3,

@@ -43,6 +43,8 @@ class AnomalyScoreInputs:
     directional_aggressor_imbalance: float | None = None
     open_interest_rel_change: float | None = None
     news_delta_minutes: float | None = None
+    # Used to decide whether a positive news timing constitutes "pre-news" evidence.
+    min_news_lead_minutes: float = 5.0
     recent_anomaly_count: int = 0
     recent_max_score: float | None = None
 
@@ -110,7 +112,11 @@ def score_anomaly(inputs: AnomalyScoreInputs) -> DeterministicAnomalyScore:
     )
     band = score_band(score)
 
-    pre_news = inputs.news_delta_minutes is not None and inputs.news_delta_minutes >= 5.0
+    pre_news = (
+        inputs.news_delta_minutes is not None
+        and inputs.min_news_lead_minutes is not None
+        and float(inputs.news_delta_minutes) >= float(inputs.min_news_lead_minutes)
+    )
     repeated_anomaly = inputs.recent_anomaly_count >= 2 and (inputs.recent_max_score or 0.0) >= 35.0
 
     should_emit = (

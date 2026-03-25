@@ -17,6 +17,7 @@ from gui.data import (
     get_default_event_id,
     get_recent_spike_feed,
     load_dashboard_data,
+    load_dashboard_data_batch,
 )
 from model.event_prices import DEFAULT_BASE_URL
 
@@ -67,12 +68,12 @@ def _polymarket_event_url(event: dict[str, Any]) -> str | None:
     return f"https://polymarket.com/event/{slug}"
 
 
-@st.cache_data(ttl=5, show_spinner=False)
+@st.cache_data(ttl=3, show_spinner=False)
 def _cached_recent_spike_feed(limit: int) -> list[dict[str, Any]]:
     return get_recent_spike_feed(limit=limit)
 
 
-@st.cache_data(ttl=5, show_spinner=False)
+@st.cache_data(ttl=12, show_spinner=False)
 def _cached_dashboard_data(event_id: str, base_url: str, news_path: str) -> dict[str, Any]:
     return load_dashboard_data(event_id, base_url=base_url, news_path=news_path)
 
@@ -80,6 +81,11 @@ def _cached_dashboard_data(event_id: str, base_url: str, news_path: str) -> dict
 @st.cache_data(ttl=15, show_spinner=False)
 def _cached_daily_top_signals(limit: int) -> list[dict[str, Any]]:
     return get_daily_top_signal_feed(limit=limit)
+
+
+@st.cache_data(ttl=12, show_spinner=False)
+def _cached_dashboard_data_batch(event_ids: tuple[str, ...], base_url: str, news_path: str) -> dict[str, dict[str, Any]]:
+    return load_dashboard_data_batch(list(event_ids), base_url=base_url, news_path=news_path)
 
 
 def _render_spike_metrics(spike: dict[str, Any]) -> None:
@@ -268,7 +274,7 @@ def _render_event_card(
 
 
 def _render_daily_top_signals_tab(feed_limit: int, *, base_url: str, news_path: str) -> None:
-    st.subheader("Daily Top Insider Signals")
+    st.subheader("Daily Top Signals")
     today_utc = pd.Timestamp.utcnow().strftime("%Y-%m-%d")
     st.caption(f"Ranking day: {today_utc} (UTC)")
 
@@ -276,7 +282,7 @@ def _render_daily_top_signals_tab(feed_limit: int, *, base_url: str, news_path: 
         rows = _cached_daily_top_signals(feed_limit)
 
     if not rows:
-        st.info("No assessed spikes with insider signal probability have been stored yet for today (UTC).")
+        st.info("No persisted deterministic or LLM-assessed signals have been stored yet for today (UTC).")
         return
 
     view_rows = [
@@ -410,14 +416,19 @@ def _render_live_dashboard_tab() -> None:
         st.write("No older whale spikes available yet.")
         return
 
-    for item in recent_feed[1:]:
+    older_items = recent_feed[1:]
+    batch_map = _cached_dashboard_data_batch(
+        tuple(str(item.get("event_id") or "").strip() for item in older_items),
+        base_url,
+        news_path,
+    )
+    for item in older_items:
         event_id = str(item.get("event_id") or "").strip()
         if not event_id:
             continue
-        try:
-            item_dashboard = _cached_dashboard_data(event_id, base_url, news_path)
-        except Exception as exc:
-            st.error(f"Failed to load spike details for {event_id}: {exc}")
+        item_dashboard = batch_map.get(event_id)
+        if item_dashboard is None:
+            st.error(f"Failed to load spike details for {event_id}: missing batch payload")
             continue
         _render_event_card(
             item_dashboard,

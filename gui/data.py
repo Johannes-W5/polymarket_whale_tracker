@@ -23,6 +23,7 @@ from database.events import get_recent_whale_spikes
 from model.event_prices import DEFAULT_BASE_URL, get_event_prices
 
 T = TypeVar("T")
+_HTTP_CLIENTS: dict[tuple[str, float], httpx.Client] = {}
 
 
 def _proxy_http_timeout() -> float:
@@ -67,10 +68,14 @@ def _json_safe(value: Any) -> Any:
 
 def _api_get_json(path: str, *, base_url: str = DEFAULT_BASE_URL, timeout: float = 30.0) -> dict[str, Any]:
     base = base_url.rstrip("/")
-    with httpx.Client(timeout=timeout) as client:
-        response = client.get(f"{base}{path}")
-        response.raise_for_status()
-        payload = response.json()
+    key = (base, float(timeout))
+    client = _HTTP_CLIENTS.get(key)
+    if client is None:
+        client = httpx.Client(timeout=timeout)
+        _HTTP_CLIENTS[key] = client
+    response = client.get(f"{base}{path}")
+    response.raise_for_status()
+    payload = response.json()
     if not isinstance(payload, dict):
         raise RuntimeError(f"Unexpected response type for {path}: {type(payload).__name__}")
     return payload
@@ -298,6 +303,7 @@ def load_dashboard_data(
     base_url: str = DEFAULT_BASE_URL,
     news_path: str = "news_scraper/data/news_events.jsonl",
 ) -> dict[str, Any]:
+    t0 = time.perf_counter()
     selected_event_id = str(event_id).strip()
     if not selected_event_id:
         raise ValueError("An event ID is required.")
@@ -372,7 +378,7 @@ def load_dashboard_data(
     except Exception as exc:
         cross_asset_error = str(exc)
 
-    return {
+    payload = {
         "event_id": selected_event_id,
         "event": _json_safe(event),
         "event_error": event_error,
@@ -387,3 +393,23 @@ def load_dashboard_data(
         "cross_asset_predictions": cross_asset_predictions,
         "cross_asset_error": cross_asset_error,
     }
+    if str(os.getenv("POLYMARKET_PERF_LOG", "")).strip().lower() in {"1", "true", "yes"}:
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        print(f"[perf] load_dashboard_data event_id={selected_event_id} elapsed_ms={elapsed_ms:.1f}", flush=True)
+    return payload
+
+
+def load_dashboard_data_batch(
+    event_ids: list[str],
+    *,
+    base_url: str = DEFAULT_BASE_URL,
+    news_path: str = "news_scraper/data/news_events.jsonl",
+) -> dict[str, dict[str, Any]]:
+    results: dict[str, dict[str, Any]] = {}
+    unique_ids = [eid for eid in dict.fromkeys([str(e).strip() for e in event_ids]) if eid]
+    for eid in unique_ids:
+        try:
+            results[eid] = load_dashboard_data(eid, base_url=base_url, news_path=news_path)
+        except Exception:
+            continue
+    return results

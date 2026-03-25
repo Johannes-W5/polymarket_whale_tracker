@@ -29,6 +29,7 @@ from typing import Any, Iterable, List, Optional, Sequence, Tuple
 import httpx
 
 from .event_prices import DEFAULT_BASE_URL, _parse_clob_token_ids
+_HTTP_CLIENTS: dict[tuple[str, float], httpx.Client] = {}
 
 
 # ---------- Shared helpers ----------
@@ -57,12 +58,18 @@ def _fetch_event(
     *,
     base_url: str | None = None,
     timeout: float = 30.0,
+    client: httpx.Client | None = None,
 ) -> dict[str, Any]:
     base = _base_url(base_url)
-    with httpx.Client(timeout=timeout) as client:
-        r = client.get(f"{base}/events/{event_id}")
-        r.raise_for_status()
-        return r.json()
+    if client is None:
+        key = (base, float(timeout))
+        client = _HTTP_CLIENTS.get(key)
+        if client is None:
+            client = httpx.Client(timeout=timeout)
+            _HTTP_CLIENTS[key] = client
+    r = client.get(f"{base}/events/{event_id}")
+    r.raise_for_status()
+    return r.json()
 
 
 def _extract_markets_from_event(event: dict[str, Any]) -> list[dict[str, Any]]:
@@ -99,6 +106,9 @@ def _coerce_float(value: Any) -> float | None:
 class MarketMetadata:
     event_id: str
     market_id: str
+    # Identifier used by the Data API `/oi` endpoint (often `conditionId`),
+    # which can differ from `market_id`.
+    condition_market_id: str | None
     title: str | None
     liquidity: float | None
     volume: float | None
@@ -112,8 +122,9 @@ def fetch_primary_market_metadata(
     base_url: str | None = None,
     market_index: int = 0,
     timeout: float = 30.0,
+    event: dict[str, Any] | None = None,
 ) -> MarketMetadata | None:
-    event = _fetch_event(event_id, base_url=base_url, timeout=timeout)
+    event = event or _fetch_event(event_id, base_url=base_url, timeout=timeout)
     markets = _extract_markets_from_event(event)
     if not markets:
         return None
@@ -124,12 +135,14 @@ def fetch_primary_market_metadata(
     if not isinstance(market, dict):
         return None
     yes_token_id, no_token_id = _parse_clob_token_ids(market)
-    market_id = market.get("id") or _select_condition_id(market)
+    condition_market_id = _select_condition_id(market)
+    market_id = market.get("id") or condition_market_id
     if market_id is None:
         return None
     return MarketMetadata(
         event_id=event_id,
         market_id=str(market_id),
+        condition_market_id=str(condition_market_id) if condition_market_id is not None else None,
         title=str(market.get("title") or market.get("question") or "").strip() or None,
         liquidity=_coerce_float(market.get("liquidity")),
         volume=_coerce_float(market.get("volume")),
@@ -400,6 +413,7 @@ def compute_orderbook_imbalance_for_event(
     market_index: int = 0,
     max_levels: int = 5,
     timeout: float = 30.0,
+    event: dict[str, Any] | None = None,
 ) -> list[OrderbookImbalance]:
     """
     Compute order book imbalance for the first market of an event.
@@ -409,7 +423,7 @@ def compute_orderbook_imbalance_for_event(
     - Sum ask size over the top `max_levels` levels.
     - Compute imbalance = (bid_depth - ask_depth) / (bid_depth + ask_depth).
     """
-    event = _fetch_event(event_id, base_url=base_url, timeout=timeout)
+    event = event or _fetch_event(event_id, base_url=base_url, timeout=timeout)
     markets = _extract_markets_from_event(event)
     if not markets:
         return []
@@ -536,12 +550,13 @@ def fetch_open_interest_for_event(
     *,
     base_url: str | None = None,
     timeout: float = 30.0,
+    event: dict[str, Any] | None = None,
 ) -> list[OpenInterestSnapshot]:
     """
     Fetch open interest values for all markets of an event via Data API `/oi`.
     """
     base = _base_url(base_url)
-    event = _fetch_event(event_id, base_url=base_url, timeout=timeout)
+    event = event or _fetch_event(event_id, base_url=base_url, timeout=timeout)
     markets = _extract_markets_from_event(event)
     if not markets:
         return []
@@ -592,7 +607,13 @@ def compute_open_interest_change(
     Pure helper for computing open interest deltas between two snapshots.
     """
     delta = curr.value - prev.value
-    rel = (delta / prev.value) if prev.value > 0 else 0.0
+    if prev.value == 0.0:
+        # Represent "activation from zero" with a well-defined relative change,
+        # preserving sign if OI ever becomes negative (unlikely).
+        denom = max(abs(curr.value), 1e-12)
+        rel = (delta / denom) if denom > 0 else 0.0
+    else:
+        rel = delta / prev.value
     return OpenInterestChange(
         event_id=curr.event_id,
         market_id=curr.market_id,
@@ -669,6 +690,7 @@ def compute_price_history_stats_for_event(
     max_points: int = 200,
     window: int = 50,
     timeout: float = 30.0,
+    event: dict[str, Any] | None = None,
 ) -> list[PriceHistoryStats]:
     """
     Compute simple price-history-based stats for each market of an event.
@@ -679,7 +701,7 @@ def compute_price_history_stats_for_event(
     - Compute a z-score of the last return relative to the previous `window`
       returns (or all, if there are fewer).
     """
-    event = _fetch_event(event_id, base_url=base_url, timeout=timeout)
+    event = event or _fetch_event(event_id, base_url=base_url, timeout=timeout)
     markets = _extract_markets_from_event(event)
     if not markets:
         return []
@@ -817,6 +839,11 @@ _NEWS_STOPWORDS = {
 }
 
 
+# In-memory cache to avoid re-parsing the JSONL dataset for every spike.
+# Cache key includes file mtime + size to invalidate when the dataset changes.
+_NEWS_RECORDS_CACHE: dict[tuple[str, float, int], list["NewsRecord"]] = {}
+
+
 def _normalize_text(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
 
@@ -870,6 +897,16 @@ def _load_news_records(path: str | Path) -> list[NewsRecord]:
     if not file_path.exists():
         return []
 
+    # Cache by (absolute path, mtime, size) so it invalidates when the JSONL changes.
+    try:
+        stat = file_path.stat()
+        cache_key = (str(file_path.resolve()), float(stat.st_mtime), int(stat.st_size))
+        cached = _NEWS_RECORDS_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+    except OSError:
+        cache_key = None
+
     records: list[NewsRecord] = []
     with file_path.open("r", encoding="utf-8") as f:
         for line in f:
@@ -911,6 +948,12 @@ def _load_news_records(path: str | Path) -> list[NewsRecord]:
                 )
             )
 
+    if cache_key is not None:
+        _NEWS_RECORDS_CACHE[cache_key] = records
+        # Keep cache small; typical runtime sees only a handful of news files.
+        if len(_NEWS_RECORDS_CACHE) > 6:
+            _NEWS_RECORDS_CACHE.pop(next(iter(_NEWS_RECORDS_CACHE)))
+
     return records
 
 
@@ -921,6 +964,7 @@ def find_nearest_news_for_event(
     base_url: str | None = None,
     news_path: str | Path = "news_scraper/data/news_events.jsonl",
     window_minutes: float = 120.0,
+    event: dict[str, Any] | None = None,
 ) -> Optional[NewsTiming]:
     """
     Find the nearest news record related to an event around a given signal time.
@@ -932,7 +976,7 @@ def find_nearest_news_for_event(
     - Among those, return the one with the smallest absolute time difference
       within `±window_minutes` of `signal_time`.
     """
-    event = _fetch_event(event_id, base_url=base_url)
+    event = event or _fetch_event(event_id, base_url=base_url)
     event_title, event_terms = _build_event_news_terms(event)
     if not event_title and not event_terms:
         return None
@@ -943,17 +987,30 @@ def find_nearest_news_for_event(
 
     best: Optional[Tuple[NewsRecord, float]] = None
     for rec in news_records:
+        delta_sec = (rec.news_time - signal_time).total_seconds()
+        delta_min = delta_sec / 60.0
+        if abs(delta_min) > window_minutes:
+            continue
         if not _record_matches_event(
             rec,
             event_title=event_title,
             event_terms=event_terms,
         ):
             continue
-        delta_sec = (rec.news_time - signal_time).total_seconds()
-        delta_min = delta_sec / 60.0
-        if abs(delta_min) > window_minutes:
+
+        if best is None:
+            best = (rec, delta_min)
             continue
-        if best is None or abs(delta_min) < abs(best[1]):
+
+        best_delta = best[1]
+        best_abs = abs(best_delta)
+        cur_abs = abs(delta_min)
+
+        # Tie-break: prefer post-news evidence (negative delta) when abs(delta)
+        # ties. I.e., for equal distances choose the smaller delta_min.
+        if cur_abs < best_abs - 1e-9:
+            best = (rec, delta_min)
+        elif abs(cur_abs - best_abs) <= 1e-9 and delta_min < best_delta:
             best = (rec, delta_min)
 
     if best is None:

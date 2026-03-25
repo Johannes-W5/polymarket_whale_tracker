@@ -15,6 +15,7 @@ from database.events import (
     get_high_score_assessments,
     insert_cross_asset_prediction,
 )
+from model.event_prices import DEFAULT_BASE_URL
 
 MODEL_VERSION = "cross-asset-ai-v1"
 MIN_TRIGGER_SCORE = 40.0
@@ -35,6 +36,7 @@ MIN_CONFIDENCE = 0.40
 MIN_RATIONALE_CHARS = 20
 SYMBOL_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,14}$")
 GENERIC_SYMBOLS = {"SPY", "QQQ", "DIA", "IWM"}
+_HTTP_CLIENTS: dict[tuple[str, float], httpx.Client] = {}
 
 
 def _clamp01(value: float) -> float:
@@ -308,23 +310,27 @@ def _request_ai_predictions(
         "You return high-precision asset impact mappings from structured event context. "
         "Avoid weakly justified assets."
     )
-    with httpx.Client(timeout=90.0) as client:
-        response = client.post(
-            _ollama_api_url(host, "chat"),
-            headers={"Authorization": f"Bearer {api_key}"},
-            json={
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": prompt},
-                ],
-                "stream": False,
-                "format": "json",
-                "options": {"temperature": 0.1},
-            },
-        )
-        response.raise_for_status()
-        raw = response.json()
+    key = (_ollama_api_url(host, "chat"), 90.0)
+    client = _HTTP_CLIENTS.get(key)
+    if client is None:
+        client = httpx.Client(timeout=90.0)
+        _HTTP_CLIENTS[key] = client
+    response = client.post(
+        _ollama_api_url(host, "chat"),
+        headers={"Authorization": f"Bearer {api_key}"},
+        json={
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+            "stream": False,
+            "format": "json",
+            "options": {"temperature": 0.1},
+        },
+    )
+    response.raise_for_status()
+    raw = response.json()
     if not isinstance(raw, dict):
         raise RuntimeError("AI response payload must be an object.")
     content = _extract_response_content(raw)
@@ -411,7 +417,18 @@ def build_predictions_for_assessment(
 
     snapshot = trigger_payload.get("deterministic_feature_snapshot")
     if not isinstance(snapshot, dict):
+        # Backfill rows keep `deterministic_feature_snapshot` as a top-level DB column;
+        # but the embedded trigger payload might be missing it depending on how the
+        # assessment was persisted.
+        snapshot = assessment_row.get("deterministic_feature_snapshot")
+    if not isinstance(snapshot, dict):
         snapshot = {}
+
+    # Ensure downstream validation uses the same snapshot source.
+    effective_trigger_payload: dict[str, Any] = trigger_payload
+    if not isinstance(trigger_payload.get("deterministic_feature_snapshot"), dict):
+        effective_trigger_payload = dict(trigger_payload)
+        effective_trigger_payload["deterministic_feature_snapshot"] = snapshot
 
     signal_time = _parse_iso8601_utc(assessment_row.get("signal_time"))
     impact_weight = _resolution_impact_weight(signal_time=signal_time, event_row=event_row)
@@ -421,7 +438,7 @@ def build_predictions_for_assessment(
     top_components = _top_components(snapshot)
     ai_payload = _build_ai_payload(
         assessment_row=assessment_row,
-        trigger_payload=trigger_payload,
+        trigger_payload=effective_trigger_payload,
         event_row=event_row,
         top_components=top_components,
     )
@@ -435,7 +452,7 @@ def build_predictions_for_assessment(
     valid_predictions = _validate_ai_predictions(
         raw_predictions,
         event_row=event_row,
-        trigger_payload=trigger_payload,
+        trigger_payload=effective_trigger_payload,
     )
     if not valid_predictions:
         return []
@@ -484,15 +501,40 @@ def generate_predictions(
     min_score: float = MIN_TRIGGER_SCORE,
     since_id: int | None = None,
     limit: int = 500,
+    base_url: str = DEFAULT_BASE_URL,
 ) -> dict[str, int]:
     assessments = get_high_score_assessments(min_score=min_score, since_id=since_id, limit=limit) or []
     inserted = 0
     processed = 0
+    event_cache: dict[str, dict[str, Any]] = {}
     for assessment in assessments:
         row = dict(assessment)
         processed += 1
         event_id = str(row.get("event_id") or "").strip()
-        event_row = dict(get_event(event_id) or {}) if event_id else {}
+        event_row = dict(event_cache.get(event_id) or {})
+        if event_id and not event_row:
+            event_row = dict(get_event(event_id) or {})
+        # Batch/backfill runs from DB rows which may omit resolution/end-date
+        # metadata. Enrich with live `/events/{id}` to keep parity with the
+        # real-time cross-asset emission path.
+        if event_id and base_url:
+            try:
+                base = base_url.rstrip("/")
+                key = (base, 30.0)
+                client = _HTTP_CLIENTS.get(key)
+                if client is None:
+                    client = httpx.Client(timeout=30.0)
+                    _HTTP_CLIENTS[key] = client
+                response = client.get(f"{base}/events/{event_id}")
+                response.raise_for_status()
+                payload = response.json()
+                if isinstance(payload, dict):
+                    event_row.update(payload)
+            except Exception:
+                # Keep DB snapshot if enrichment is unavailable.
+                pass
+        if event_id:
+            event_cache[event_id] = event_row
         predictions = build_predictions_for_assessment(row, event_row=event_row)
         for prediction in predictions:
             insert_cross_asset_prediction(**prediction)

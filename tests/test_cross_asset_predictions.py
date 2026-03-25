@@ -132,3 +132,43 @@ def test_build_predictions_gate_far_future_resolution(monkeypatch) -> None:
         },
     )
     assert rows == []
+
+
+def test_build_predictions_snapshot_fallbacks_to_assessment_row(monkeypatch) -> None:
+    _mock_ai(
+        monkeypatch,
+        predictions=[
+            {
+                "symbol": "XLE",
+                "asset_class": "commodity",
+                "direction": "up",
+                "horizon_bucket": "1d",
+                "confidence": 0.82,
+                "rationale": "opec wording in the nearby news should lift energy-sector proxies",
+            }
+        ],
+    )
+
+    assessment = {
+        "id": 1,
+        "event_id": "event-1",
+        "spike_id": "spike-1",
+        "side": "YES",
+        "signal_time": "2026-03-23T12:00:00+00:00",
+        "trigger_type": "deterministic_anomaly",
+        "deterministic_score": 82.0,
+        "deterministic_score_band": "severe",
+        # Backfill column exists...
+        "deterministic_feature_snapshot": {
+            "news_context": {"news_title": "OPEC meeting", "news_source": "reuters"}
+        },
+        # ...but embedded trigger payload is missing it.
+        "trigger_payload": {"side": "YES"},
+    }
+
+    rows = build_predictions_for_assessment(
+        assessment,
+        event_row={"name": "Unrelated event name with no obvious tokens"},
+    )
+    assert rows
+    assert rows[0]["asset_symbol"] == "XLE"

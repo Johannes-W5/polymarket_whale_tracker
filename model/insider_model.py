@@ -13,6 +13,7 @@ Outputs are research signals only and are not legal or compliance judgments.
 """
 
 import hashlib
+import math
 import json
 import os
 from dataclasses import asdict, dataclass
@@ -244,12 +245,23 @@ def _resolve_signal_time(
     return datetime.now(timezone.utc), "generated_at_fallback"
 
 
-def _bounded_probability_adjustment(value: Any) -> float:
+def _bounded_probability_adjustment(value: Any, max_adjustment: float) -> float:
+    """
+    Clamp LLM-provided adjustment to a bounded interval.
+
+    `max_adjustment` is controlled by the deterministic prior. In particular,
+    legacy payloads may set it to 0.0, meaning the LLM must not move the prior.
+    """
     try:
         numeric = float(value)
-    except (TypeError, ValueError):
-        return 0.0
-    return max(-MAX_PROBABILITY_ADJUSTMENT, min(MAX_PROBABILITY_ADJUSTMENT, numeric))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid probability_adjustment value: {value!r}") from exc
+
+    if not math.isfinite(numeric):
+        raise ValueError(f"Non-finite probability_adjustment value: {value!r}")
+
+    max_adj = abs(float(max_adjustment))
+    return max(-max_adj, min(max_adj, numeric))
 
 
 def _clamp_probability(value: Any, default: float = 0.0) -> float:
@@ -708,18 +720,47 @@ def _assessment_from_parsed_response(
     model: str,
     prompt_hash: str,
     prior_probability: float,
+    max_adjustment: float,
 ) -> InsiderAssessment:
-    adjustment = parsed.get("probability_adjustment")
-    if adjustment is None and "probability_insider" in parsed:
-        adjustment = _clamp_probability(parsed.get("probability_insider"), default=prior_probability) - prior_probability
-    bounded_adjustment = _bounded_probability_adjustment(adjustment)
-    final_probability = _clamp_probability(prior_probability + bounded_adjustment, default=prior_probability)
+    if "probability_adjustment" in parsed:
+        if parsed.get("probability_adjustment") is None:
+            raise RuntimeError("LLM response missing probability_adjustment")
+        bounded_adjustment = _bounded_probability_adjustment(
+            parsed.get("probability_adjustment"),
+            max_adjustment=max_adjustment,
+        )
+    elif "probability_insider" in parsed:
+        raw_insider = parsed.get("probability_insider")
+        if raw_insider is None:
+            raise RuntimeError("LLM response missing probability_insider")
+        try:
+            insider_prob = float(raw_insider)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"LLM response has invalid probability_insider: {raw_insider!r}") from exc
+        if not math.isfinite(insider_prob):
+            raise RuntimeError(f"LLM response has non-finite probability_insider: {raw_insider!r}")
+        insider_prob_clamped = _clamp_probability(insider_prob, default=prior_probability)
+        bounded_adjustment = _bounded_probability_adjustment(
+            insider_prob_clamped - prior_probability,
+            max_adjustment=max_adjustment,
+        )
+    else:
+        raise RuntimeError("LLM response missing probability_adjustment/probability_insider")
 
-    confidence = str(parsed.get("confidence") or "low").strip().lower()
+    final_probability = prior_probability + bounded_adjustment
+    final_probability = _clamp_probability(final_probability, default=prior_probability)
+
+    confidence_raw = parsed.get("confidence")
+    if not isinstance(confidence_raw, str):
+        raise RuntimeError("LLM response confidence must be a string")
+    confidence = confidence_raw.strip().lower()
     if confidence not in {"low", "medium", "high"}:
-        confidence = "low"
+        raise RuntimeError(f"LLM response confidence invalid: {confidence_raw!r}")
 
-    summary = str(parsed.get("short_summary") or "").strip() or DEFAULT_SUMMARY_FALLBACK
+    summary_raw = parsed.get("short_summary")
+    if not isinstance(summary_raw, str) or not summary_raw.strip():
+        raise RuntimeError("LLM response short_summary must be a non-empty string")
+    summary = summary_raw.strip()
 
     return InsiderAssessment(
         probability_insider=final_probability,
@@ -768,6 +809,13 @@ def _assess_with_payload(
         ((explanation_payload.get("deterministic_prior") or {}).get("probability")),
         default=0.5,
     )
+    raw_max_adjustment = ((explanation_payload.get("deterministic_prior") or {}).get("max_adjustment"))
+    try:
+        max_adjustment = abs(float(raw_max_adjustment))
+    except (TypeError, ValueError):
+        max_adjustment = MAX_PROBABILITY_ADJUSTMENT
+    if not math.isfinite(max_adjustment):
+        max_adjustment = MAX_PROBABILITY_ADJUSTMENT
 
     system_prompt = (
         "You explain public-data anomaly evidence. The deterministic scorer remains the "
@@ -813,12 +861,25 @@ def _assess_with_payload(
                     reason="malformed_or_unavailable_response",
                 )
 
-    return _assessment_from_parsed_response(
-        parsed,
-        model=ollama_model,
-        prompt_hash=prompt_hash,
-        prior_probability=prior_probability,
-    )
+    try:
+        return _assessment_from_parsed_response(
+            parsed,
+            model=ollama_model,
+            prompt_hash=prompt_hash,
+            prior_probability=prior_probability,
+            max_adjustment=max_adjustment,
+        )
+    except (RuntimeError, ValueError) as exc:
+        print(
+            f"[insider-model] Malformed LLM response for event {event_id}: {exc}",
+            flush=True,
+        )
+        return _fallback_assessment(
+            model=ollama_model,
+            prompt_hash=prompt_hash,
+            prior_probability=prior_probability,
+            reason="malformed_or_invalid_llm_response",
+        )
 
 
 def assess_insider_probability_from_payload(

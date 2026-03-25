@@ -4,6 +4,7 @@ from datetime import datetime
 import json
 from types import SimpleNamespace
 from typing import Any, Mapping
+from psycopg2.extras import execute_values
 
 from .connection import get_connection
 
@@ -68,6 +69,46 @@ def get_all_event_ids() -> list[str]:
     return [str(row["id"]) for row in rows]
 
 
+def get_active_events(*, limit: int = 10000, offset: int = 0) -> list[dict[str, Any]]:
+    """
+    Return active events from Postgres for fast listing.
+
+    Note: the `events` table stores only a subset of the Gamma event payload
+    (no markets). This endpoint is meant for listing/selecting events, while
+    `GET /events/{id}` should remain the Gamma proxy for full details.
+    """
+    with closing(get_connection()) as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, name, description, created_at, active
+            FROM events
+            WHERE active = TRUE
+            ORDER BY id
+            LIMIT %s OFFSET %s;
+            """,
+            (max(1, int(limit)), max(0, int(offset))),
+        )
+        rows = cur.fetchall()
+
+    result: list[dict[str, Any]] = []
+    for row in rows or []:
+        created_at = row.get("created_at")
+        if isinstance(created_at, datetime):
+            created_at_value = created_at.isoformat()
+        else:
+            created_at_value = created_at
+        result.append(
+            {
+                "id": row.get("id"),
+                "name": row.get("name"),
+                "description": row.get("description"),
+                "created_at": created_at_value,
+                "active": row.get("active"),
+            }
+        )
+    return result
+
+
 def get_event(event_id: str):
     with closing(get_connection()) as conn, conn.cursor() as cur:
         cur.execute("SELECT * FROM events WHERE id = %s;", (event_id,))
@@ -98,6 +139,41 @@ def _upsert_event_row(cur, event: Any) -> None:
     )
 
 
+def _upsert_event_rows(cur, events: list[Any]) -> int:
+    normalized_rows = []
+    for event in events:
+        if not _is_event_active(event):
+            continue
+        normalized = _normalize_event_for_db(event)
+        normalized_rows.append(
+            (
+                normalized.id,
+                normalized.name,
+                normalized.description,
+                normalized.created_at,
+                normalized.active,
+            )
+        )
+    if not normalized_rows:
+        return 0
+    execute_values(
+        cur,
+        """
+        INSERT INTO events (id, name, description, created_at, active)
+        VALUES %s
+        ON CONFLICT (id) DO UPDATE
+        SET
+          name = EXCLUDED.name,
+          description = EXCLUDED.description,
+          created_at = EXCLUDED.created_at,
+          active = EXCLUDED.active;
+        """,
+        normalized_rows,
+        page_size=1000,
+    )
+    return len(normalized_rows)
+
+
 def insert_event(event):
     with closing(get_connection()) as conn, conn.cursor() as cur:
         _upsert_event_row(cur, event)
@@ -124,6 +200,7 @@ def _ensure_market_reference(cur, market_id: str | None, *, volume: float | None
 
 def insert_whale_spike(spike, market_id: str | None = None):
     with closing(get_connection()) as conn, conn.cursor() as cur:
+        _ensure_hot_path_indexes(cur)
         _ensure_market_reference(
             cur,
             market_id,
@@ -135,17 +212,8 @@ def insert_whale_spike(spike, market_id: str | None = None):
               event_id, market_id, from_ts, to_ts, side,
               from_price, to_price, abs_change, rel_change
             )
-            SELECT
-              %s,%s,%s,%s,%s,%s,%s,%s,%s
-            WHERE NOT EXISTS (
-              SELECT 1
-              FROM whale_spikes ws
-              WHERE ws.event_id = %s
-                AND ws.market_id IS NOT DISTINCT FROM %s
-                AND ws.from_ts = %s
-                AND ws.to_ts = %s
-                AND ws.side = %s
-            );
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (event_id, market_id, from_ts, to_ts, side) DO NOTHING;
             """,
             (
                 spike.event_id,
@@ -157,11 +225,6 @@ def insert_whale_spike(spike, market_id: str | None = None):
                 spike.to_price,
                 spike.abs_change,
                 spike.rel_change,
-                spike.event_id,
-                market_id,
-                spike.from_ts,
-                spike.to_ts,
-                spike.side,
             ),
         )
         conn.commit() 
@@ -258,6 +321,24 @@ def _ensure_cross_asset_predictions_table(cur) -> None:
     )
 
 
+def _ensure_hot_path_indexes(cur) -> None:
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS ix_whale_spikes_to_ts_desc ON whale_spikes (to_ts DESC);"
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS ix_whale_spikes_event_to_ts_desc ON whale_spikes (event_id, to_ts DESC);"
+    )
+    cur.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_whale_spikes_identity ON whale_spikes (event_id, market_id, from_ts, to_ts, side);"
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS ix_insider_assessments_event_created_to_ts ON insider_assessments (event_id, created_at DESC, to_ts DESC);"
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS ix_insider_assessments_signal_time ON insider_assessments (signal_time);"
+    )
+
+
 def insert_insider_assessment(
     *,
     event_id: str,
@@ -269,6 +350,7 @@ def insert_insider_assessment(
 ) -> int | None:
     with closing(get_connection()) as conn, conn.cursor() as cur:
         _ensure_insider_assessments_table(cur)
+        _ensure_hot_path_indexes(cur)
         _ensure_market_reference(
             cur,
             market_id,
@@ -364,6 +446,7 @@ def insert_cross_asset_prediction(
 ):
     with closing(get_connection()) as conn, conn.cursor() as cur:
         _ensure_cross_asset_predictions_table(cur)
+        _ensure_hot_path_indexes(cur)
         cur.execute(
             """
             INSERT INTO cross_asset_predictions (
@@ -383,17 +466,15 @@ def insert_cross_asset_prediction(
               signal_time,
               metadata
             )
-            SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s::jsonb
-            WHERE NOT EXISTS (
-              SELECT 1
-              FROM cross_asset_predictions cap
-              WHERE cap.assessment_id IS NOT DISTINCT FROM %s
-                AND cap.event_id = %s
-                AND cap.spike_id IS NOT DISTINCT FROM %s
-                AND cap.asset_symbol = %s
-                AND cap.horizon_bucket = %s
-                AND cap.model_version = %s
-            );
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s::jsonb)
+            ON CONFLICT (
+              COALESCE(assessment_id, -1),
+              event_id,
+              COALESCE(spike_id, ''),
+              asset_symbol,
+              horizon_bucket,
+              model_version
+            ) DO NOTHING;
             """,
             (
                 assessment_id,
@@ -411,12 +492,6 @@ def insert_cross_asset_prediction(
                 source_score_band,
                 signal_time,
                 json.dumps(metadata) if metadata is not None else None,
-                assessment_id,
-                str(event_id),
-                spike_id,
-                str(asset_symbol).upper(),
-                str(horizon_bucket).lower(),
-                str(model_version),
             ),
         )
         conn.commit()
@@ -424,7 +499,6 @@ def insert_cross_asset_prediction(
 
 def get_latest_cross_asset_predictions_for_event(event_id: str, limit: int = 20):
     with closing(get_connection()) as conn, conn.cursor() as cur:
-        _ensure_cross_asset_predictions_table(cur)
         cur.execute(
             """
             SELECT
@@ -462,7 +536,6 @@ def get_high_score_assessments(
     limit: int = 500,
 ):
     with closing(get_connection()) as conn, conn.cursor() as cur:
-        _ensure_insider_assessments_table(cur)
         params: list[Any] = [float(min_score)]
         where = ["deterministic_score >= %s", "trigger_payload IS NOT NULL"]
         if since_id is not None:
@@ -556,7 +629,6 @@ def get_latest_whale_spikes(limit: int = 20):
 
 def get_latest_assessment_for_event(event_id: str):
     with closing(get_connection()) as conn, conn.cursor() as cur:
-        _ensure_insider_assessments_table(cur)
         cur.execute(
             """
             SELECT
@@ -605,7 +677,6 @@ def get_daily_top_probability_spikes(
     limit: int = 50,
 ):
     with closing(get_connection()) as conn, conn.cursor() as cur:
-        _ensure_insider_assessments_table(cur)
         cur.execute(
             """
             SELECT
@@ -628,10 +699,12 @@ def get_daily_top_probability_spikes(
               ia.created_at
             FROM insider_assessments ia
             LEFT JOIN events e ON e.id = ia.event_id
-            WHERE ia.probability_insider IS NOT NULL
+            WHERE (ia.probability_insider IS NOT NULL OR ia.deterministic_score IS NOT NULL)
               AND ia.signal_time >= %s
               AND ia.signal_time < %s
-            ORDER BY ia.probability_insider DESC, ia.signal_time DESC
+            ORDER BY
+              COALESCE(ia.probability_insider, ia.deterministic_score / 100.0) DESC,
+              ia.signal_time DESC
             LIMIT %s;
             """,
             (day_start, day_end, max(1, min(int(limit), 500))),

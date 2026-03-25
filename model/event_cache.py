@@ -11,8 +11,9 @@ from typing import Any, Dict, List
 import httpx
 
 from database.connection import get_connection
-from database.events import _upsert_event_row
+from database.events import _upsert_event_rows
 from .event_prices import DEFAULT_BASE_URL
+_HTTP_CLIENTS: dict[tuple[str, float], httpx.Client] = {}
 
 
 def _is_event_active(event: Dict[str, Any]) -> bool:
@@ -45,12 +46,16 @@ def fetch_events_page(
         "closed": "false",
     }
     last_exc: Exception | None = None
+    key = (base, float(timeout))
+    client = _HTTP_CLIENTS.get(key)
+    if client is None:
+        client = httpx.Client(timeout=timeout)
+        _HTTP_CLIENTS[key] = client
     for attempt in range(max(1, retries)):
         try:
-            with httpx.Client(timeout=timeout) as client:
-                r = client.get(f"{base}/events", params=params)
-                r.raise_for_status()
-                payload = r.json()
+            r = client.get(f"{base}/events", params=params)
+            r.raise_for_status()
+            payload = r.json()
             if isinstance(payload, list):
                 raw_n = len(payload)
                 filtered = [
@@ -134,12 +139,8 @@ def sync_events_to_db(
                 break
 
             page_upserts = 0
-            for event in events:
-                if not _is_event_active(event):
-                    continue
-                _upsert_event_row(cur, event)
-                total += 1
-                page_upserts += 1
+            page_upserts = _upsert_event_rows(cur, events)
+            total += page_upserts
 
             conn.commit()
             print(

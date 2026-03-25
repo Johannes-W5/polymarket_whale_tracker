@@ -4,6 +4,7 @@ from model.insider_model import (
     MAX_PROBABILITY_ADJUSTMENT,
     PROMPT_VERSION,
     assess_insider_probability_from_payload,
+    _assessment_from_parsed_response,
 )
 
 
@@ -87,3 +88,90 @@ def test_assess_from_payload_fallback_keeps_deterministic_prior(monkeypatch) -> 
     assert result.probability_adjustment == 0.0
     assert result.fallback_reason == "malformed_or_unavailable_response"
     assert "deterministic public-data anomaly score" in result.short_summary
+
+
+def test_assess_from_payload_negative_adjustment_is_bounded(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "model.insider_model._request_ollama_assessment",
+        lambda **kwargs: {
+            "probability_adjustment": -999.0,
+            "confidence": "HIGH",
+            "short_summary": "A negative adjustment is bounded to the deterministic prior interval.",
+        },
+    )
+
+    result = assess_insider_probability_from_payload(
+        _trigger_payload(score=82.0, band="severe"),
+        ollama_host="https://ollama.example.com",
+        ollama_api_key="test-key",
+        model="test-model",
+    )
+
+    assert result.probability_adjustment == -MAX_PROBABILITY_ADJUSTMENT
+    assert result.probability_insider == max(
+        0.0,
+        result.deterministic_prior_probability - MAX_PROBABILITY_ADJUSTMENT,
+    )
+    assert result.confidence == "high"
+
+
+def test_assess_from_payload_missing_probability_key_triggers_fallback(monkeypatch) -> None:
+    def _partial(**kwargs):
+        return {
+            "confidence": "HIGH",
+            "short_summary": "Missing probability_adjustment should not be accepted.",
+        }
+
+    monkeypatch.setattr("model.insider_model._request_ollama_assessment", _partial)
+
+    result = assess_insider_probability_from_payload(
+        _trigger_payload(score=60.0, band="high"),
+        ollama_host="https://ollama.example.com",
+        ollama_api_key="test-key",
+        model="test-model",
+    )
+
+    assert result.deterministic_prior_probability is not None
+    assert result.probability_insider == result.deterministic_prior_probability
+    assert result.probability_adjustment == 0.0
+    assert result.fallback_reason == "malformed_or_invalid_llm_response"
+
+
+def test_assess_from_payload_rejects_nan_probability_adjustment(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "model.insider_model._request_ollama_assessment",
+        lambda **kwargs: {
+            "probability_adjustment": "nan",
+            "confidence": "HIGH",
+            "short_summary": "NaN adjustments must be rejected.",
+        },
+    )
+
+    result = assess_insider_probability_from_payload(
+        _trigger_payload(score=82.0, band="severe"),
+        ollama_host="https://ollama.example.com",
+        ollama_api_key="test-key",
+        model="test-model",
+    )
+
+    assert result.deterministic_prior_probability is not None
+    assert result.probability_insider == result.deterministic_prior_probability
+    assert result.fallback_reason == "malformed_or_invalid_llm_response"
+
+
+def test_assessment_from_parsed_response_respects_max_adjustment_zero() -> None:
+    parsed = {
+        "probability_adjustment": 0.5,
+        "confidence": "high",
+        "short_summary": "Adjustment must be forced to 0 when max_adjustment is 0.",
+    }
+    result = _assessment_from_parsed_response(
+        parsed,
+        model="test-model",
+        prompt_hash="prompt-hash",
+        prior_probability=0.6,
+        max_adjustment=0.0,
+    )
+
+    assert result.probability_adjustment == 0.0
+    assert result.probability_insider == 0.6

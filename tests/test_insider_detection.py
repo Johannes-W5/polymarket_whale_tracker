@@ -5,6 +5,9 @@ from datetime import datetime, timezone
 from model.anomaly_scoring import AnomalyScoreInputs, score_anomaly
 from model.insider_detection import TriggeredInsiderAssessment, WhaleSpike, monitor_event_and_assess_insider
 from model.insider_model import InsiderAssessment
+from model.insider_detection import PriceSample
+from model.anomaly_scoring import DeterministicAnomalyScore
+from model.market_signals import MarketMetadata, OpenInterestSnapshot
 
 
 def _make_spike(*, llm_should_invoke: bool, score: float, band: str = "high") -> WhaleSpike:
@@ -150,3 +153,181 @@ def test_monitor_event_and_assess_insider_runs_llm_when_gate_passes(monkeypatch)
     assert called["llm"] == 1
     assert results[0].assessment is not None
     assert results[0].assessment.llm_version == "test-model"
+
+
+def test_score_spike_candidate_passes_min_news_lead_minutes(monkeypatch) -> None:
+    """
+    Deterministic pre-news gating must respect the configured `min_news_lead_minutes`,
+    not a hardcoded constant.
+    """
+    import model.insider_detection as det
+
+    captured: dict[str, object] = {}
+
+    def fake_score_anomaly(inputs: AnomalyScoreInputs) -> DeterministicAnomalyScore:
+        captured["min_news_lead_minutes"] = inputs.min_news_lead_minutes
+        return DeterministicAnomalyScore(
+            deterministic_score=50.0,
+            deterministic_score_band="high",
+            deterministic_feature_snapshot={"gating": {"should_emit": True, "should_call_llm": False}},
+            scorer_version="deterministic-v1",
+            trigger_type="deterministic_anomaly",
+            should_emit=True,
+            should_call_llm=False,
+            llm_gate_reason="test",
+        )
+
+    # Avoid network/data dependency: keep all feature builders empty/None.
+    monkeypatch.setattr(det, "score_anomaly", fake_score_anomaly)
+    monkeypatch.setattr(det, "fetch_primary_market_metadata", lambda *args, **kwargs: None)
+    monkeypatch.setattr(det, "compute_orderbook_imbalance_for_event", lambda *args, **kwargs: [])
+    monkeypatch.setattr(det, "compute_trade_burst_stats", lambda *args, **kwargs: None)
+    monkeypatch.setattr(det, "compute_price_history_stats_for_event", lambda *args, **kwargs: [])
+    monkeypatch.setattr(det, "fetch_open_interest_for_event", lambda *args, **kwargs: [])
+    monkeypatch.setattr(det, "_safe_fetch_news", lambda *args, **kwargs: None)
+
+    ts = datetime(2026, 3, 22, 12, 0, tzinfo=timezone.utc)
+    spike = WhaleSpike(
+        event_id="event-1",
+        from_ts=ts,
+        to_ts=ts,
+        side="YES",
+        from_price=0.40,
+        to_price=0.45,
+        abs_change=0.05,
+        rel_change=0.125,
+        market_id="market-1",
+        spike_id="spike-1",
+        news_delta_minutes=6.0,
+        market_liquidity=25_000.0,
+        market_volume=1_000.0,
+    )
+    signal_sample = PriceSample(
+        event_id="event-1",
+        captured_at=ts,
+        yes_price=0.40,
+        no_price=0.60,
+        market_id="market-1",
+        market_title="test",
+        market_liquidity=25_000.0,
+        market_volume=1_000.0,
+        yes_token_id="token-yes",
+        no_token_id="token-no",
+    )
+
+    det._score_spike_candidate(
+        spike,
+        event_id="event-1",
+        signal_sample=signal_sample,
+        base_url="http://localhost:8000",
+        news_path="news.jsonl",
+        news_window_minutes=240.0,
+        min_news_lead_minutes=10.0,
+        request_timeout=30.0,
+        prev_open_interest_by_market={},
+        recent_anomalies=[],
+    )
+
+    assert captured["min_news_lead_minutes"] == 10.0
+
+
+def test_score_spike_candidate_oi_fallback_uses_condition_market_id(monkeypatch) -> None:
+    """
+    If `spike.market_id` and the Data API `/oi` market identifier differ,
+    `_score_spike_candidate` must still compute `open_interest_rel_change`.
+    """
+    import model.insider_detection as det
+
+    captured: dict[str, object] = {}
+
+    def fake_score_anomaly(inputs: AnomalyScoreInputs) -> DeterministicAnomalyScore:
+        captured["open_interest_rel_change"] = inputs.open_interest_rel_change
+        return DeterministicAnomalyScore(
+            deterministic_score=50.0,
+            deterministic_score_band="high",
+            deterministic_feature_snapshot={"gating": {"should_emit": True, "should_call_llm": False}},
+            scorer_version="deterministic-v1",
+            trigger_type="deterministic_anomaly",
+            should_emit=True,
+            should_call_llm=False,
+            llm_gate_reason="test",
+        )
+
+    monkeypatch.setattr(det, "score_anomaly", fake_score_anomaly)
+    monkeypatch.setattr(det, "compute_orderbook_imbalance_for_event", lambda *args, **kwargs: [])
+    monkeypatch.setattr(det, "compute_trade_burst_stats", lambda *args, **kwargs: None)
+    monkeypatch.setattr(det, "compute_price_history_stats_for_event", lambda *args, **kwargs: [])
+    monkeypatch.setattr(det, "_safe_fetch_news", lambda *args, **kwargs: None)
+
+    # OI snapshots keyed by condition id.
+    monkeypatch.setattr(
+        det,
+        "fetch_open_interest_for_event",
+        lambda *args, **kwargs: [
+            OpenInterestSnapshot(event_id="event-1", market_id="cond-1", value=110.0)
+        ],
+    )
+
+    # Market metadata returns a different `market_id` (price sampling) but the condition id used by OI.
+    monkeypatch.setattr(
+        det,
+        "fetch_primary_market_metadata",
+        lambda *args, **kwargs: MarketMetadata(
+            event_id="event-1",
+            market_id="id-1",
+            condition_market_id="cond-1",
+            title="test",
+            liquidity=25_000.0,
+            volume=1_000.0,
+            yes_token_id="token-yes",
+            no_token_id="token-no",
+        ),
+    )
+
+    ts = datetime(2026, 3, 22, 12, 0, tzinfo=timezone.utc)
+    spike = WhaleSpike(
+        event_id="event-1",
+        from_ts=ts,
+        to_ts=ts,
+        side="YES",
+        from_price=0.40,
+        to_price=0.45,
+        abs_change=0.05,
+        rel_change=0.125,
+        market_id="id-1",
+        spike_id="spike-1",
+        news_delta_minutes=6.0,
+        market_liquidity=25_000.0,
+        market_volume=1_000.0,
+    )
+    signal_sample = PriceSample(
+        event_id="event-1",
+        captured_at=ts,
+        yes_price=0.40,
+        no_price=0.60,
+        market_id="id-1",
+        market_title="test",
+        market_liquidity=25_000.0,
+        market_volume=1_000.0,
+        yes_token_id="token-yes",
+        no_token_id="token-no",
+    )
+
+    prev_open_interest_by_market = {
+        "cond-1": OpenInterestSnapshot(event_id="event-1", market_id="cond-1", value=100.0)
+    }
+
+    det._score_spike_candidate(
+        spike,
+        event_id="event-1",
+        signal_sample=signal_sample,
+        base_url="http://localhost:8000",
+        news_path="news.jsonl",
+        news_window_minutes=240.0,
+        min_news_lead_minutes=10.0,
+        request_timeout=30.0,
+        prev_open_interest_by_market=prev_open_interest_by_market,
+        recent_anomalies=[],
+    )
+
+    assert captured["open_interest_rel_change"] == 0.1

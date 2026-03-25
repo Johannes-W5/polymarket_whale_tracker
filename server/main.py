@@ -10,13 +10,23 @@ start server: python -m uvicorn main:app --reload
 
 """
 from contextlib import asynccontextmanager
+from pathlib import Path
+import sys
+import time
 from typing import Any
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+# Ensure `database/` (repo root sibling of `server/`) is importable even when
+# running uvicorn from inside `server/`.
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from config import CLOB_API, DATA_API, GAMMA_API
+from database.events import get_active_events as get_active_events_from_db
 
 
 @asynccontextmanager
@@ -41,8 +51,23 @@ app = FastAPI(
 
 
 def _query_params(request: Request) -> dict[str, Any]:
-    """Forward query params, excluding internal ones."""
-    return {k: v for k, v in request.query_params.items()}
+    """
+    Forward query params, excluding internal ones.
+
+    Important: preserve repeated query keys (e.g. `market=a&market=b`) instead of
+    collapsing to a single "last value wins" entry.
+    """
+    params: dict[str, Any] = {}
+    for key, value in request.query_params.multi_items():
+        if key in params:
+            current = params[key]
+            if isinstance(current, list):
+                current.append(value)
+            else:
+                params[key] = [current, value]
+        else:
+            params[key] = value
+    return params
 
 
 def _gamma_events_params(request: Request) -> dict[str, Any]:
@@ -53,9 +78,13 @@ def _gamma_events_params(request: Request) -> dict[str, Any]:
     (often old resolved markets). Match model.event_cache filters unless the client
     opts out with raw=1 (pass-through to Gamma, raw stripped).
     """
-    params = dict(_query_params(request))
-    raw_val = str(params.pop("raw", "")).lower()
-    if raw_val in ("1", "true", "yes"):
+    params = _query_params(request)
+    raw_val: Any = params.pop("raw", "")
+    # `raw` can appear multiple times (rare), treat "last raw" as the effective one.
+    if isinstance(raw_val, list) and raw_val:
+        raw_val = raw_val[-1]
+    raw_val_str = str(raw_val).lower()
+    if raw_val_str in ("1", "true", "yes"):
         return params
     if "active" not in params:
         params["active"] = "true"
@@ -72,12 +101,42 @@ async def _proxy_get(
     path: str,
     path_param: str | None = None,
 ) -> JSONResponse:
+    t0 = time.perf_counter()
     url = f"{base}{path}"
     if path_param:
         url = f"{base}{path.replace('{id}', path_param)}"
     params = _query_params(request)
     client: httpx.AsyncClient = request.app.state.http
-    r = await client.get(url, params=params)
+    try:
+        r = await client.get(url, params=params)
+    except httpx.ReadError as exc:
+        return JSONResponse(
+            status_code=502,
+            content={"detail": "Upstream read error", "error": str(exc)},
+        )
+    except httpx.TimeoutException as exc:
+        return JSONResponse(
+            status_code=504,
+            content={"detail": "Upstream timeout", "error": str(exc)},
+        )
+    except httpx.HTTPError as exc:
+        return JSONResponse(
+            status_code=502,
+            content={"detail": "Upstream HTTP error", "error": str(exc)},
+        )
+
+    headers = getattr(r, "headers", {}) or {}
+    content_type = str(headers.get("content-type") or "").lower()
+    if "application/json" in content_type:
+        resp = Response(
+            status_code=r.status_code,
+            content=r.content,
+            media_type="application/json",
+        )
+        if str(request.query_params.get("perf", "")).lower() in {"1", "true", "yes"}:
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            resp.headers["X-Proxy-Elapsed-Ms"] = f"{elapsed_ms:.1f}"
+        return resp
     try:
         content = r.json()
     except Exception:
@@ -91,9 +150,37 @@ async def _proxy_get(
 @app.get("/events", tags=["Gamma"])
 async def get_events(request: Request):
     """List events with optional filtering and pagination (defaults match event_cache)."""
+    use_db_flag = request.query_params.get("use_db") or request.query_params.get("source")
+    use_db = str(use_db_flag or "").strip().lower() in ("1", "true", "yes", "db", "database", "postgres")
+
+    if use_db:
+        # DB listing mode is intentionally minimal: it returns the subset of
+        # fields stored by `model/event_cache` (no markets). Use
+        # `GET /events/{id}` for full Gamma event payloads.
+        try:
+            limit = request.query_params.get("limit")
+            offset = request.query_params.get("offset")
+            db_limit = int(limit) if limit is not None else 10000
+            db_offset = int(offset) if offset is not None else 0
+        except (TypeError, ValueError):
+            db_limit = 10000
+            db_offset = 0
+        return JSONResponse(
+            status_code=200,
+            content=get_active_events_from_db(limit=db_limit, offset=db_offset),
+        )
+
     params = _gamma_events_params(request)
     client: httpx.AsyncClient = request.app.state.http
     r = await client.get(f"{GAMMA_API}/events", params=params)
+    headers = getattr(r, "headers", {}) or {}
+    content_type = str(headers.get("content-type") or "").lower()
+    if "application/json" in content_type:
+        return Response(
+            status_code=r.status_code,
+            content=r.content,
+            media_type="application/json",
+        )
     try:
         content = r.json()
     except Exception:

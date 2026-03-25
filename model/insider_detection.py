@@ -17,6 +17,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from time import sleep
+import time
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 
 import httpx
@@ -40,6 +41,11 @@ ALL_EVENTS_MIN_REL_CHANGE = 0.03
 DEFAULT_ASSESSMENT_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:cloud")
 DEFAULT_ASSESSMENT_TEMPERATURE = 0.1
 RECENT_ANOMALY_WINDOW_MINUTES = 60.0
+_HTTP_CLIENTS: dict[tuple[str, float], httpx.Client] = {}
+
+
+def _perf_log_enabled() -> bool:
+    return str(os.getenv("POLYMARKET_PERF_LOG", "")).strip().lower() in {"1", "true", "yes"}
 
 try:  # pragma: no cover - import fallback
     from .anomaly_scoring import (  # type: ignore[relative-beyond-top-level]
@@ -213,10 +219,14 @@ def _event_is_currently_active(
     timeout: float = 30.0,
 ) -> bool:
     base = base_url.rstrip("/")
-    with httpx.Client(timeout=timeout) as client:
-        r = client.get(f"{base}/events/{event_id}")
-        r.raise_for_status()
-        event = r.json()
+    key = (base, float(timeout))
+    client = _HTTP_CLIENTS.get(key)
+    if client is None:
+        client = httpx.Client(timeout=timeout)
+        _HTTP_CLIENTS[key] = client
+    r = client.get(f"{base}/events/{event_id}")
+    r.raise_for_status()
+    event = r.json()
     if not isinstance(event, dict):
         return False
     return bool(event.get("active")) and not bool(event.get("closed", False))
@@ -338,6 +348,7 @@ def _safe_fetch_news(
     base_url: str,
     news_path: str,
     window_minutes: float,
+    event: dict[str, Any] | None = None,
 ) -> NewsTiming | None:
     try:
         return find_nearest_news_for_event(
@@ -346,6 +357,7 @@ def _safe_fetch_news(
             base_url=base_url,
             news_path=news_path,
             window_minutes=window_minutes,
+            event=event,
         )
     except Exception as exc:
         print(f"[whale-tracking] Failed to fetch news timing for event {event_id}: {exc}", flush=True)
@@ -360,13 +372,35 @@ def _score_spike_candidate(
     base_url: str,
     news_path: str,
     news_window_minutes: float,
+    min_news_lead_minutes: float,
     request_timeout: float,
     prev_open_interest_by_market: dict[str, OpenInterestSnapshot],
     recent_anomalies: list[WhaleSpike],
 ) -> WhaleSpike | None:
+    t0 = time.perf_counter()
+    event_payload: dict[str, Any] | None = None
+    try:
+        key = (base_url.rstrip("/"), float(request_timeout))
+        client = _HTTP_CLIENTS.get(key)
+        if client is None:
+            client = httpx.Client(timeout=request_timeout)
+            _HTTP_CLIENTS[key] = client
+        response = client.get(f"{base_url.rstrip('/')}/events/{event_id}")
+        response.raise_for_status()
+        payload = response.json()
+        if isinstance(payload, dict):
+            event_payload = payload
+    except Exception:
+        event_payload = None
+
     market_meta = None
     try:
-        market_meta = fetch_primary_market_metadata(event_id, base_url=base_url, timeout=request_timeout)
+        market_meta = fetch_primary_market_metadata(
+            event_id,
+            base_url=base_url,
+            timeout=request_timeout,
+            event=event_payload,
+        )
     except Exception as exc:
         print(f"[whale-tracking] Failed to fetch market metadata for event {event_id}: {exc}", flush=True)
 
@@ -378,7 +412,12 @@ def _score_spike_candidate(
 
     orderbooks: list[OrderbookImbalance] = []
     try:
-        orderbooks = compute_orderbook_imbalance_for_event(event_id, base_url=base_url, timeout=request_timeout)
+        orderbooks = compute_orderbook_imbalance_for_event(
+            event_id,
+            base_url=base_url,
+            timeout=request_timeout,
+            event=event_payload,
+        )
     except Exception as exc:
         print(f"[whale-tracking] Failed to fetch order book features for event {event_id}: {exc}", flush=True)
 
@@ -399,6 +438,7 @@ def _score_spike_candidate(
             event_id,
             base_url=base_url,
             timeout=request_timeout,
+            event=event_payload,
         )
     except Exception as exc:
         print(f"[whale-tracking] Failed to fetch price history stats for event {event_id}: {exc}", flush=True)
@@ -409,19 +449,35 @@ def _score_spike_candidate(
             event_id,
             base_url=base_url,
             timeout=request_timeout,
+            event=event_payload,
         ):
             current_oi_by_market[snapshot.market_id] = snapshot
     except Exception as exc:
         print(f"[whale-tracking] Failed to fetch open interest for event {event_id}: {exc}", flush=True)
 
     oi_rel_change = None
-    if spike.market_id and spike.market_id in current_oi_by_market:
-        prev_oi = prev_open_interest_by_market.get(spike.market_id)
-        if prev_oi is not None:
-            oi_rel_change = compute_open_interest_change(
-                prev_oi,
-                current_oi_by_market[spike.market_id],
-            ).rel_change
+    # OI snapshots are keyed by the Data API `/oi` "market" identifier
+    # (often `conditionId`). Your spike.market_id is derived from the price
+    # sampling path and may be a different identifier (e.g. `market.id`).
+    lookup_keys: list[str] = []
+    if spike.market_id:
+        lookup_keys.append(str(spike.market_id))
+    if market_meta is not None and getattr(market_meta, "condition_market_id", None):
+        key = str(getattr(market_meta, "condition_market_id"))
+        if key not in lookup_keys:
+            lookup_keys.append(key)
+
+    for key in lookup_keys:
+        if key not in current_oi_by_market:
+            continue
+        prev_oi = prev_open_interest_by_market.get(key)
+        if prev_oi is None:
+            continue
+        oi_rel_change = compute_open_interest_change(
+            prev_oi,
+            current_oi_by_market[key],
+        ).rel_change
+        break
     prev_open_interest_by_market.update(current_oi_by_market)
 
     news_timing = _safe_fetch_news(
@@ -430,6 +486,7 @@ def _score_spike_candidate(
         base_url=base_url,
         news_path=news_path,
         window_minutes=news_window_minutes,
+        event=event_payload,
     )
     if news_timing is not None:
         spike.news_time = news_timing.news_time
@@ -472,6 +529,7 @@ def _score_spike_candidate(
             directional_aggressor_imbalance=directional_aggressor_imbalance,
             open_interest_rel_change=oi_rel_change,
             news_delta_minutes=spike.news_delta_minutes,
+            min_news_lead_minutes=min_news_lead_minutes,
             recent_anomaly_count=len(recent_anomalies),
             recent_max_score=max(recent_scores) if recent_scores else None,
         )
@@ -532,6 +590,12 @@ def _score_spike_candidate(
     spike.llm_should_invoke = scored.should_call_llm
     spike.llm_gate_reason = scored.llm_gate_reason
 
+    if _perf_log_enabled():
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        print(
+            f"[perf] _score_spike_candidate event_id={event_id} elapsed_ms={elapsed_ms:.1f}",
+            flush=True,
+        )
     return spike if scored.should_emit else None
 
 
@@ -544,6 +608,7 @@ def monitor_event_for_spikes(
     min_rel_change: float = DEFAULT_MIN_REL_CHANGE,
     news_path: str = "news_scraper/data/news_events.jsonl",
     news_window_minutes: float = 240.0,
+    min_news_lead_minutes: float = 5.0,
     sample_iter_factory: Callable[..., Iterable[PriceSample]] | None = None,
     request_timeout: float = 30.0,
 ) -> Iterator[WhaleSpike]:
@@ -574,6 +639,7 @@ def monitor_event_for_spikes(
                     base_url=base_url,
                     news_path=news_path,
                     news_window_minutes=news_window_minutes,
+                    min_news_lead_minutes=min_news_lead_minutes,
                     request_timeout=request_timeout,
                     prev_open_interest_by_market=prev_open_interest_by_market,
                     recent_anomalies=recent_anomalies,
@@ -647,6 +713,7 @@ def monitor_event_for_informed_flow(
         min_rel_change=min_rel_change,
         news_path=news_path,
         news_window_minutes=news_window_minutes,
+        min_news_lead_minutes=min_news_lead_minutes,
         sample_iter_factory=sample_iter_factory,
         request_timeout=request_timeout,
     ):
@@ -799,6 +866,7 @@ def monitor_event_and_assess_insider(
         min_rel_change=min_rel_change,
         news_path=news_path,
         news_window_minutes=news_window_minutes,
+        min_news_lead_minutes=min_news_lead_minutes,
         sample_iter_factory=sample_iter_factory,
         request_timeout=request_timeout,
     ):
