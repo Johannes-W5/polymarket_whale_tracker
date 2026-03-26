@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,6 +20,8 @@ DEFAULT_BASE_URL = os.getenv(
     "POLYMARKET_API_BASE",
     "http://127.0.0.1:8000",
 ).rstrip("/")
+DEFAULT_HTTP_RETRIES = max(1, int(os.getenv("POLYMARKET_HTTP_RETRIES", "3")))
+DEFAULT_HTTP_RETRY_DELAY = max(0.0, float(os.getenv("POLYMARKET_HTTP_RETRY_DELAY", "0.5")))
 
 
 @dataclass
@@ -97,9 +100,35 @@ def get_event_prices(
         and yes_token_id, no_token_id when present.
     """
     base = base_url.rstrip("/")
+
+    def _get_with_retries(client: httpx.Client, url: str, *, params: dict[str, Any] | None = None) -> httpx.Response:
+        last_exc: Exception | None = None
+        for attempt in range(DEFAULT_HTTP_RETRIES):
+            try:
+                response = client.get(url, params=params)
+                if response.status_code in (502, 503, 504):
+                    last_exc = httpx.HTTPStatusError(
+                        f"Transient upstream error: {response.status_code}",
+                        request=response.request,
+                        response=response,
+                    )
+                    if attempt < DEFAULT_HTTP_RETRIES - 1:
+                        time.sleep(min(DEFAULT_HTTP_RETRY_DELAY * (2**attempt), 5.0))
+                        continue
+                return response
+            except (httpx.TransportError, httpx.TimeoutException) as exc:
+                last_exc = exc
+                if attempt < DEFAULT_HTTP_RETRIES - 1:
+                    time.sleep(min(DEFAULT_HTTP_RETRY_DELAY * (2**attempt), 5.0))
+                    continue
+                raise
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("retry loop exited without response")
+
     with httpx.Client(timeout=timeout) as client:
         # 1) Get event and token IDs from first open (non-closed) market
-        r = client.get(f"{base}/events/{event_id}")
+        r = _get_with_retries(client, f"{base}/events/{event_id}")
         r.raise_for_status()
         event: dict[str, Any] = r.json()
         markets = event.get("markets") or []
@@ -144,7 +173,8 @@ def get_event_prices(
             )
 
         # 2) Fetch both prices in one request (CLOB: token_ids and sides comma-separated)
-        r = client.get(
+        r = _get_with_retries(
+            client,
             f"{base}/prices",
             params={
                 "token_ids": f"{yes_token_id},{no_token_id}",

@@ -26,7 +26,14 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from config import CLOB_API, DATA_API, GAMMA_API
-from database.events import get_active_events as get_active_events_from_db
+
+
+def get_active_events_from_db(*, limit: int = 10000, offset: int = 0):
+    # Lazy import keeps proxy startup robust in environments where only the
+    # server app is deployed without the DB module path.
+    from database.events import get_active_events
+
+    return get_active_events(limit=limit, offset=offset)
 
 
 @asynccontextmanager
@@ -165,10 +172,19 @@ async def get_events(request: Request):
         except (TypeError, ValueError):
             db_limit = 10000
             db_offset = 0
-        return JSONResponse(
-            status_code=200,
-            content=get_active_events_from_db(limit=db_limit, offset=db_offset),
-        )
+        try:
+            return JSONResponse(
+                status_code=200,
+                content=get_active_events_from_db(limit=db_limit, offset=db_offset),
+            )
+        except Exception as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "detail": "DB-backed events mode unavailable on this deployment.",
+                    "error": str(exc),
+                },
+            )
 
     params = _gamma_events_params(request)
     client: httpx.AsyncClient = request.app.state.http
