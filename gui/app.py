@@ -366,7 +366,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-default_base_url = os.getenv("POLYMARKET_API_BASE", DEFAULT_BASE_URL)
+default_base_url = DEFAULT_BASE_URL
 default_news_path = os.getenv("NEWS_EVENTS_PATH", "news_scraper/data/news_events.jsonl")
 
 with st.sidebar:

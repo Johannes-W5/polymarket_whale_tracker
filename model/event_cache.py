@@ -12,7 +12,7 @@ import httpx
 
 from database.connection import get_connection
 from database.events import _upsert_event_rows
-from .event_prices import DEFAULT_BASE_URL
+from .event_prices import DEFAULT_BASE_URL, normalize_polymarket_api_base_url
 _HTTP_CLIENTS: dict[tuple[str, float], httpx.Client] = {}
 
 
@@ -38,7 +38,7 @@ def fetch_events_page(
 
     Retries up to `retries` times on 5xx errors before giving up.
     """
-    base = base_url.rstrip("/")
+    base = normalize_polymarket_api_base_url(base_url)
     params = {
         "limit": max(1, min(int(limit), 1000)),
         "offset": max(0, int(offset)),
@@ -157,13 +157,12 @@ def sync_events_to_db(
 
 if __name__ == "__main__":
     import argparse
-    import os
 
     parser = argparse.ArgumentParser(description="Backfill Polymarket events into PostgreSQL.")
     parser.add_argument(
         "--base-url",
-        default=os.getenv("POLYMARKET_API_BASE", DEFAULT_BASE_URL),
-        help="Base URL of the local Polymarket proxy server.",
+        default=DEFAULT_BASE_URL,
+        help="Base URL of the Polymarket proxy (POLYMARKET_API_BASE; scheme optional, https assumed).",
     )
     parser.add_argument("--page-size", type=int, default=500)
     parser.add_argument("--max-pages", type=int, default=20)

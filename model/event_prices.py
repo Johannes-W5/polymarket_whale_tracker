@@ -16,10 +16,35 @@ from typing import Any
 import httpx
 
 
-DEFAULT_BASE_URL = os.getenv(
-    "POLYMARKET_API_BASE",
-    "http://127.0.0.1:8000",
-).rstrip("/")
+def _normalize_polymarket_api_base(raw: str | None, fallback: str) -> str:
+    """
+    POLYMARKET_API_BASE is often pasted as a hostname in Render/GitHub secrets.
+    httpx requires an explicit http:// or https:// scheme.
+    """
+    base = (raw or "").strip()
+    if base.startswith("\ufeff"):
+        base = base[1:].strip()
+    base = base or fallback
+    # Strip one layer of surrounding quotes from copy-paste into secret managers.
+    if len(base) >= 2 and base[0] == base[-1] and base[0] in "\"'":
+        base = base[1:-1].strip() or fallback
+    if not base.lower().startswith(("http://", "https://")):
+        base = f"https://{base.lstrip('/')}"
+    out = base.rstrip("/")
+    if not out.lower().startswith(("http://", "https://")):
+        raise ValueError(
+            f"Invalid API base URL after normalization: {raw!r} -> {out!r} "
+            f"(set POLYMARKET_API_BASE to e.g. https://your-proxy.onrender.com)"
+        )
+    return out
+
+
+def normalize_polymarket_api_base_url(raw: str | None) -> str:
+    """Normalize POLYMARKET_API_BASE / --base-url for httpx (scheme required)."""
+    return _normalize_polymarket_api_base(raw, "http://127.0.0.1:8000")
+
+
+DEFAULT_BASE_URL = normalize_polymarket_api_base_url(os.getenv("POLYMARKET_API_BASE"))
 DEFAULT_HTTP_RETRIES = max(1, int(os.getenv("POLYMARKET_HTTP_RETRIES", "3")))
 DEFAULT_HTTP_RETRY_DELAY = max(0.0, float(os.getenv("POLYMARKET_HTTP_RETRY_DELAY", "0.5")))
 
@@ -99,7 +124,7 @@ def get_event_prices(
         EventPrices with yes_price, no_price (float or None if unavailable),
         and yes_token_id, no_token_id when present.
     """
-    base = base_url.rstrip("/")
+    base = normalize_polymarket_api_base_url(base_url)
 
     def _get_with_retries(client: httpx.Client, url: str, *, params: dict[str, Any] | None = None) -> httpx.Response:
         last_exc: Exception | None = None

@@ -1054,8 +1054,8 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--base-url",
-        default=os.getenv("POLYMARKET_API_BASE", DEFAULT_BASE_URL),
-        help="Base URL of the local Polymarket proxy server.",
+        default=DEFAULT_BASE_URL,
+        help="Base URL of the Polymarket proxy (POLYMARKET_API_BASE; scheme optional, https assumed).",
     )
     parser.add_argument(
         "--interval",
